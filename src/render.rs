@@ -18,6 +18,9 @@ pub struct GpuVertex {
     /// Emission (sRGB) in xyz, w = 1 when the vertex has a UV.
     pub emi: [f32; 4],
     pub uv: [f32; 2],
+    /// Texture layers + 1 of the normal, roughness and metalness maps (0 = none);
+    /// w = occlusion layer + 1 + 1024 × (emission layer + 1).
+    pub maps: [f32; 4],
 }
 
 impl GpuVertex {
@@ -25,7 +28,7 @@ impl GpuVertex {
     pub const DEFAULT_MAT: [f32; 4] = [0.0, 0.8, 0.0, 0.0];
     /// Unlit line vertex.
     pub fn line(pos: glam::Vec3, c: [f32; 3]) -> Self {
-        GpuVertex { pos: pos.to_array(), nrm: [0.0; 3], col: [c[0], c[1], c[2], 1.0], mat: [0.0; 4], emi: [0.0; 4], uv: [0.0; 2] }
+        GpuVertex { pos: pos.to_array(), nrm: [0.0; 3], col: [c[0], c[1], c[2], 1.0], mat: [0.0; 4], emi: [0.0; 4], uv: [0.0; 2], maps: [0.0; 4] }
     }
 }
 
@@ -77,6 +80,9 @@ pub struct FrameGeometry {
     pub lights: Vec<GpuLight>,
     /// Texture layers (layer 0 = UV checker). Shared between frames while unchanged.
     pub textures: Option<Arc<crate::texture::TextureSet>>,
+    /// Area lights for the path tracer: (centre, half-extent X, half-extent Y, emission
+    /// direction, linear colour × intensity).
+    pub area_lights: Vec<(glam::Vec3, glam::Vec3, glam::Vec3, glam::Vec3, [f32; 3])>,
     /// Camera icons, drawn per view (a view doesn't draw the camera it looks through).
     pub camera_icons: Vec<(crate::scene::NodeId, Vec<GpuVertex>)>,
     /// Shadow-casting light: (light view-projection, index into `lights`).
@@ -244,11 +250,12 @@ struct U {
 struct VIn {
     @location(0) pos: vec3<f32>, @location(1) nrm: vec3<f32>, @location(2) col: vec4<f32>,
     @location(3) mat: vec4<f32>, @location(4) emi: vec4<f32>, @location(5) uv: vec2<f32>,
+    @location(6) maps: vec4<f32>,
 };
 struct VOut {
     @builtin(position) clip: vec4<f32>, @location(0) nrm: vec3<f32>, @location(1) col: vec4<f32>,
     @location(2) wpos: vec3<f32>, @location(3) mat: vec4<f32>, @location(4) emi: vec4<f32>,
-    @location(5) uv: vec2<f32>,
+    @location(5) uv: vec2<f32>, @location(6) maps: vec4<f32>,
 };
 
 @vertex fn vs_tri(v: VIn) -> VOut {
@@ -260,6 +267,7 @@ struct VOut {
     o.mat = v.mat;
     o.emi = v.emi;
     o.uv = v.uv;
+    o.maps = v.maps;
     return o;
 }
 
@@ -291,13 +299,38 @@ fn spec_term(n: vec3<f32>, l: vec3<f32>, v: vec3<f32>, rough: f32) -> f32 {
     return pow(max(dot(n, h), 0.0), shin) * (shin + 8.0) / 25.13;
 }
 
-fn shade(i: VOut, ff: bool, texel: vec4<f32>) -> vec4<f32> {
+struct MapSamples {
+    nrm: vec4<f32>, rough: vec4<f32>, metal: vec4<f32>, ao: vec4<f32>, emis: vec4<f32>,
+    dp1: vec3<f32>, dp2: vec3<f32>, duv1: vec2<f32>, duv2: vec2<f32>,
+};
+
+fn shade(i: VOut, ff: bool, texel: vec4<f32>, ms: MapSamples) -> vec4<f32> {
     var n = normalize(i.nrm);
     if (!ff) { n = -n; }
     let flags = u32(u.cam.w + 0.5);
     let v = normalize(u.cam.xyz - i.wpos);
     var base = pow(i.col.rgb, vec3<f32>(2.2));
     let has_uv = i.emi.w > 0.5;
+    let maps_on = has_uv && (flags & 8u) != 0u && (flags & 16u) == 0u;
+    var rough = i.mat.y;
+    var metal = i.mat.z;
+    if (maps_on && i.maps.x > 0.5) {
+        // Cotangent frame from screen-space derivatives (no stored tangents needed).
+        let dp2perp = cross(ms.dp2, n);
+        let dp1perp = cross(n, ms.dp1);
+        let t = dp2perp * ms.duv1.x + dp1perp * ms.duv2.x;
+        let b = dp2perp * ms.duv1.y + dp1perp * ms.duv2.y;
+        let inv = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
+        let tsn = pow(ms.nrm.rgb, vec3<f32>(1.0 / 2.2)) * 2.0 - 1.0;
+        n = normalize(t * inv * tsn.x + b * inv * tsn.y + n * max(tsn.z, 0.05));
+    }
+    if (maps_on && i.maps.y > 0.5) { rough = rough * pow(ms.rough.r, 1.0 / 2.2); }
+    if (maps_on && i.maps.z > 0.5) { metal = metal * pow(ms.metal.r, 1.0 / 2.2); }
+    let packed = u32(i.maps.w + 0.5);
+    var ao = 1.0;
+    if (maps_on && (packed % 1024u) > 0u) { ao = pow(ms.ao.r, 1.0 / 2.2); }
+    var emis_tex = vec3<f32>(1.0);
+    if (maps_on && (packed / 1024u) > 0u) { emis_tex = ms.emis.rgb; }
     let layer = i32(i.mat.w + 0.5) - 1;
     if (has_uv && (flags & 16u) != 0u) {
         base = texel.rgb;
@@ -305,7 +338,7 @@ fn shade(i: VOut, ff: bool, texel: vec4<f32>) -> vec4<f32> {
         base = texel.rgb;
     }
     let spec_w = i.mat.x;
-    let metal = i.mat.z;
+    
     let dcol = base * (1.0 - metal);
     let scol = mix(vec3<f32>(spec_w), base * max(spec_w, 0.5), metal);
     var lin = vec3<f32>(0.0);
@@ -316,7 +349,7 @@ fn shade(i: VOut, ff: bool, texel: vec4<f32>) -> vec4<f32> {
             let L = u.lights[k];
             let kind = i32(L.pos.w + 0.5);
             if (kind == 0) {
-                lin = lin + dcol * L.col.rgb;
+                lin = lin + dcol * L.col.rgb * ao;
                 continue;
             }
             var l = -L.dir.xyz;
@@ -333,22 +366,22 @@ fn shade(i: VOut, ff: bool, texel: vec4<f32>) -> vec4<f32> {
                 att = att * shadow_factor(i.wpos, n);
             }
             let ndl = max(dot(n, l), 0.0);
-            lin = lin + (dcol * ndl + scol * spec_term(n, l, v, i.mat.y) * ndl) * L.col.rgb * att;
+            lin = lin + (dcol * ndl + scol * spec_term(n, l, v, rough) * ndl) * L.col.rgb * att;
         }
-        lin = lin + dcol * 0.03;
+        lin = lin + dcol * 0.03 * ao;
     } else {
         let l = normalize(u.light.xyz);
         let diff = max(dot(n, l), 0.0);
         let fill = max(dot(n, normalize(vec3<f32>(-0.3, 0.6, -0.4))), 0.0) * 0.15;
-        lin = dcol * (0.12 + 0.88 * diff + fill) + scol * spec_term(n, l, v, i.mat.y) * diff * 0.6 + base * metal * 0.15;
+        lin = dcol * (0.12 * ao + 0.88 * diff + fill * ao) + scol * spec_term(n, l, v, rough) * diff * 0.6 + base * metal * 0.15;
     }
     // Cheap hemispherical environment reflection so metals and glossy surfaces read.
     let rv = reflect(-v, n);
     let env = mix(vec3<f32>(0.04, 0.04, 0.045), vec3<f32>(0.45, 0.47, 0.5), clamp(rv.y * 0.5 + 0.5, 0.0, 1.0));
     let fres = 0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
-    let refl = mix(vec3<f32>(fres * spec_w), base, metal) * (1.0 - i.mat.y * 0.6);
-    lin = lin + env * refl;
-    lin = lin + pow(i.emi.rgb, vec3<f32>(2.2));
+    let refl = mix(vec3<f32>(fres * spec_w), base, metal) * (1.0 - rough * 0.6);
+    lin = lin + env * refl * ao;
+    lin = lin + pow(i.emi.rgb, vec3<f32>(2.2)) * emis_tex;
     var a = i.col.a;
     if ((flags & 4u) != 0u) { a = min(a, u.info.z); }
     return vec4<f32>(pow(lin, vec3<f32>(1.0 / 2.2)), a);
@@ -360,7 +393,18 @@ fn shade(i: VOut, ff: bool, texel: vec4<f32>) -> vec4<f32> {
     var layer = max(i32(i.mat.w + 0.5) - 1, 0);
     if ((flags & 16u) != 0u) { layer = 0; }
     let texel = textureSample(tex_arr, tex_samp, i.uv, layer);
-    return shade(i, ff, texel);
+    var ms: MapSamples;
+    ms.nrm = textureSample(tex_arr, tex_samp, i.uv, max(i32(i.maps.x + 0.5) - 1, 0));
+    ms.rough = textureSample(tex_arr, tex_samp, i.uv, max(i32(i.maps.y + 0.5) - 1, 0));
+    ms.metal = textureSample(tex_arr, tex_samp, i.uv, max(i32(i.maps.z + 0.5) - 1, 0));
+    let packed = u32(i.maps.w + 0.5);
+    ms.ao = textureSample(tex_arr, tex_samp, i.uv, max(i32(packed % 1024u) - 1, 0));
+    ms.emis = textureSample(tex_arr, tex_samp, i.uv, max(i32(packed / 1024u) - 1, 0));
+    ms.dp1 = dpdx(i.wpos);
+    ms.dp2 = dpdy(i.wpos);
+    ms.duv1 = dpdx(i.uv);
+    ms.duv2 = dpdy(i.uv);
+    return shade(i, ff, texel, ms);
 }
 
 @vertex fn vs_line(v: VIn) -> VOut {
@@ -373,6 +417,7 @@ fn shade(i: VOut, ff: bool, texel: vec4<f32>) -> vec4<f32> {
     o.mat = v.mat;
     o.emi = v.emi;
     o.uv = v.uv;
+    o.maps = v.maps;
     return o;
 }
 
@@ -573,7 +618,7 @@ impl Renderer {
         let vlayout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<GpuVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x2],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x2, 6 => Float32x4],
         };
         let make_scene_pipeline = |label: &str,
                                    vs: &str,

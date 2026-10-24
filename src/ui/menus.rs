@@ -74,6 +74,7 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             if item(ui, "Export Selection (glTF / USD)...", "") {
                 actions.push(Action::Export(true));
             }
+            ui.checkbox(&mut app.usd_bake_points, "USD: bake skinning to points (instead of UsdSkel)");
             ui.separator();
             planned(ui, "Reference Editor");
             ui.separator();

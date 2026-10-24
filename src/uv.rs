@@ -431,6 +431,427 @@ pub fn uvs_of_faces(m: &Mesh, faces: &[usize]) -> HashSet<u32> {
     faces.iter().filter_map(|f| m.face_uvs.get(*f)).flatten().copied().collect()
 }
 
+// ------------------------------------------------------------------ cut / sew / unfold
+
+fn ekey(a: u32, b: u32) -> (u32, u32) {
+    if a < b { (a, b) } else { (b, a) }
+}
+
+/// Faces using each (undirected) mesh edge, with the corner indices of both endpoints.
+fn edge_corners(m: &Mesh) -> HashMap<(u32, u32), Vec<(usize, usize, usize)>> {
+    let mut map: HashMap<(u32, u32), Vec<(usize, usize, usize)>> = HashMap::new();
+    for (f, face) in m.faces.iter().enumerate() {
+        let n = face.len();
+        for k in 0..n {
+            let (a, b) = (face[k], face[(k + 1) % n]);
+            // (face, corner of the smaller vertex, corner of the larger vertex)
+            let (ka, kb) = if a < b { (k, (k + 1) % n) } else { ((k + 1) % n, k) };
+            map.entry(ekey(a, b)).or_default().push((f, ka, kb));
+        }
+    }
+    map
+}
+
+/// Split UVs along the given mesh edges (vertex pairs). Returns the number of UVs added.
+pub fn cut_edges(m: &mut Mesh, cuts: &HashSet<(u32, u32)>) -> usize {
+    if !m.has_uvs() {
+        return 0;
+    }
+    // Corners are (face, k) flattened.
+    let mut offs = Vec::with_capacity(m.faces.len());
+    let mut total = 0;
+    for f in &m.faces {
+        offs.push(total);
+        total += f.len();
+    }
+    let mut parent: Vec<usize> = (0..total).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for (e, list) in edge_corners(m) {
+        if cuts.contains(&e) || list.len() != 2 {
+            continue;
+        }
+        let ((f, ka, kb), (g, la, lb)) = (list[0], list[1]);
+        for (c1, c2) in [(offs[f] + ka, offs[g] + la), (offs[f] + kb, offs[g] + lb)] {
+            let (fu, gu) = (m.face_uvs[f][c1 - offs[f]], m.face_uvs[g][c2 - offs[g]]);
+            if fu == gu {
+                let (a, b) = (find(&mut parent, c1), find(&mut parent, c2));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+    }
+    // Corners sharing a UV but in different groups get their own copy.
+    let mut owner: HashMap<u32, usize> = HashMap::new();
+    let mut group_uv: HashMap<usize, u32> = HashMap::new();
+    let mut added = 0;
+    for f in 0..m.faces.len() {
+        for k in 0..m.faces[f].len() {
+            let c = offs[f] + k;
+            let root = find(&mut parent, c);
+            let u = m.face_uvs[f][k];
+            if let Some(&nu) = group_uv.get(&root) {
+                m.face_uvs[f][k] = nu;
+                continue;
+            }
+            match owner.get(&u) {
+                None => {
+                    owner.insert(u, root);
+                    group_uv.insert(root, u);
+                }
+                Some(&r) if r == root => {
+                    group_uv.insert(root, u);
+                }
+                Some(_) => {
+                    m.uvs.push(m.uvs[u as usize]);
+                    let nu = (m.uvs.len() - 1) as u32;
+                    group_uv.insert(root, nu);
+                    m.face_uvs[f][k] = nu;
+                    added += 1;
+                }
+            }
+        }
+    }
+    added
+}
+
+/// UV shell id per UV index.
+fn uv_shell_ids(m: &Mesh) -> Vec<usize> {
+    let mut parent: Vec<usize> = (0..m.uvs.len()).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    for f in &m.face_uvs {
+        for w in f.windows(2) {
+            let (a, b) = (find(&mut parent, w[0] as usize), find(&mut parent, w[1] as usize));
+            if a != b {
+                parent[a] = b;
+            }
+        }
+    }
+    (0..m.uvs.len()).map(|i| find(&mut parent, i)).collect()
+}
+
+/// Sew UVs along the given mesh edges. A separate shell is moved, rotated and scaled onto
+/// the other side first (Maya's Move and Sew). Returns the number of edges sewn.
+pub fn sew_edges(m: &mut Mesh, sews: &HashSet<(u32, u32)>) -> usize {
+    if !m.has_uvs() {
+        return 0;
+    }
+    let mut sewn = 0;
+    let mut edges: Vec<(u32, u32)> = sews.iter().copied().collect();
+    edges.sort();
+    for e in edges {
+        let ec = edge_corners(m);
+        let Some(list) = ec.get(&e) else { continue };
+        if list.len() != 2 {
+            continue;
+        }
+        let ((f, ka, kb), (g, la, lb)) = (list[0], list[1]);
+        let (fa, fb) = (m.face_uvs[f][ka], m.face_uvs[f][kb]);
+        let (ga, gb) = (m.face_uvs[g][la], m.face_uvs[g][lb]);
+        if fa == ga && fb == gb {
+            continue;
+        }
+        let shell = uv_shell_ids(m);
+        if shell[fa as usize] != shell[ga as usize] {
+            // Similarity transform mapping g's edge onto f's edge, applied to g's shell.
+            let (p0, p1) = (m.uvs[ga as usize], m.uvs[gb as usize]);
+            let (q0, q1) = (m.uvs[fa as usize], m.uvs[fb as usize]);
+            let (d, t) = (p1 - p0, q1 - q0);
+            let den = d.length_squared().max(1e-12);
+            // Complex ratio t / d.
+            let s = Vec2::new((t.x * d.x + t.y * d.y) / den, (t.y * d.x - t.x * d.y) / den);
+            let sid = shell[ga as usize];
+            for (i, uv) in m.uvs.iter_mut().enumerate() {
+                if shell[i] == sid {
+                    let z = *uv - p0;
+                    *uv = q0 + Vec2::new(s.x * z.x - s.y * z.y, s.x * z.y + s.y * z.x);
+                }
+            }
+        } else {
+            let (ma, mb) = ((m.uvs[fa as usize] + m.uvs[ga as usize]) * 0.5, (m.uvs[fb as usize] + m.uvs[gb as usize]) * 0.5);
+            m.uvs[fa as usize] = ma;
+            m.uvs[fb as usize] = mb;
+        }
+        for fu in m.face_uvs.iter_mut() {
+            for u in fu.iter_mut() {
+                if *u == ga {
+                    *u = fa;
+                } else if *u == gb {
+                    *u = fb;
+                }
+            }
+        }
+        sewn += 1;
+    }
+    m.compact_uvs();
+    sewn
+}
+
+/// Unfold UV shells with Least Squares Conformal Maps (two pinned UVs, conjugate gradient),
+/// then rescale each shell to its 3D area and keep it where it was. `faces` limits the
+/// shells to those containing the given faces. Returns the number of shells unfolded.
+pub fn unfold(m: &mut Mesh, faces: Option<&[usize]>) -> usize {
+    if !m.has_uvs() {
+        return 0;
+    }
+    let want: Option<HashSet<usize>> = faces.map(|f| f.iter().copied().collect());
+    // Texel density of the whole mesh (UV area per 3D area), so unfolded shells match it.
+    let (mut a2, mut a3) = (0.0f64, 0.0f64);
+    for (f, fu) in m.faces.iter().zip(&m.face_uvs) {
+        for k in 1..f.len().saturating_sub(1) {
+            let (a, b, c) = (m.positions[f[0] as usize], m.positions[f[k] as usize], m.positions[f[k + 1] as usize]);
+            a3 += ((b - a).cross(c - a).length() * 0.5) as f64;
+            let (ua, ub, uc) = (m.uvs[fu[0] as usize], m.uvs[fu[k] as usize], m.uvs[fu[k + 1] as usize]);
+            a2 += ((ub - ua).perp_dot(uc - ua).abs() * 0.5) as f64;
+        }
+    }
+    let density = if a3 > 1e-12 && a2 > 1e-12 { a2 / a3 } else { 1.0 };
+    let mut count = 0;
+    for shell in shells(m) {
+        if let Some(w) = &want
+            && !shell.iter().any(|f| w.contains(f))
+        {
+            continue;
+        }
+        if unfold_shell(m, &shell, density) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn unfold_shell(m: &mut Mesh, shell: &[usize], density: f64) -> bool {
+    // Local indices of the shell's UVs and their 3D positions.
+    let mut local: HashMap<u32, usize> = HashMap::new();
+    let mut ids: Vec<u32> = Vec::new();
+    let mut p3: Vec<Vec3> = Vec::new();
+    for &f in shell {
+        for (k, &u) in m.face_uvs[f].iter().enumerate() {
+            local.entry(u).or_insert_with(|| {
+                ids.push(u);
+                p3.push(m.positions[m.faces[f][k] as usize]);
+                ids.len() - 1
+            });
+        }
+    }
+    let n = ids.len();
+    if n < 3 {
+        return false;
+    }
+    // A closed shell (no UV border) can't be flattened without a seam.
+    let mut border: HashMap<(u32, u32), i32> = HashMap::new();
+    for &f in shell {
+        let fu = &m.face_uvs[f];
+        for k in 0..fu.len() {
+            *border.entry(ekey(fu[k], fu[(k + 1) % fu.len()])).or_default() += 1;
+        }
+    }
+    if !border.values().any(|c| *c == 1) {
+        return false;
+    }
+    // Triangles (fan) with local indices.
+    let mut tris: Vec<[usize; 3]> = Vec::new();
+    for &f in shell {
+        let fu = &m.face_uvs[f];
+        for k in 1..fu.len().saturating_sub(1) {
+            tris.push([local[&fu[0]], local[&fu[k]], local[&fu[k + 1]]]);
+        }
+    }
+    // Pins: two far-apart UVs.
+    let far = |from: usize| (0..n).max_by(|a, b| p3[*a].distance_squared(p3[from]).total_cmp(&p3[*b].distance_squared(p3[from]))).unwrap();
+    let pa = far(0);
+    let pb = far(pa);
+    if pa == pb {
+        return false;
+    }
+    let dist = p3[pa].distance(p3[pb]) as f64;
+    // Rows of the conformal energy: unknowns are u_i (2i) and v_i (2i + 1).
+    let mut rows: Vec<Vec<(usize, f64)>> = Vec::with_capacity(tris.len() * 2);
+    let mut area3d = 0.0f64;
+    for t in &tris {
+        let (a, b, c) = (p3[t[0]], p3[t[1]], p3[t[2]]);
+        let e1 = b - a;
+        let nrm = e1.cross(c - a);
+        let ar = nrm.length() as f64 * 0.5;
+        if ar < 1e-14 || e1.length() < 1e-12 {
+            continue;
+        }
+        area3d += ar;
+        let x = e1.normalize();
+        let y = nrm.normalize().cross(x);
+        let q = [(0.0f64, 0.0f64), (e1.length() as f64, 0.0), ((c - a).dot(x) as f64, (c - a).dot(y) as f64)];
+        let w = [(q[2].0 - q[1].0, q[2].1 - q[1].1), (q[0].0 - q[2].0, q[0].1 - q[2].1), (q[1].0 - q[0].0, q[1].1 - q[0].1)];
+        let s = 1.0 / ar.sqrt();
+        let mut re = Vec::with_capacity(6);
+        let mut im = Vec::with_capacity(6);
+        for j in 0..3 {
+            let (wr, wi) = w[j];
+            re.push((2 * t[j], wr * s));
+            re.push((2 * t[j] + 1, -wi * s));
+            im.push((2 * t[j], wi * s));
+            im.push((2 * t[j] + 1, wr * s));
+        }
+        rows.push(re);
+        rows.push(im);
+    }
+    if rows.is_empty() {
+        return false;
+    }
+    let pinned = |var: usize| var / 2 == pa || var / 2 == pb;
+    let pin_val = |var: usize| -> f64 {
+        match (var / 2 == pb, var % 2) {
+            (true, 0) => dist,
+            _ => 0.0,
+        }
+    };
+    // Normal equations restricted to free variables: (AᵀA) x = -Aᵀ A_p x_p.
+    let nv = 2 * n;
+    let apply = |x: &[f64], out: &mut [f64]| {
+        out.iter_mut().for_each(|o| *o = 0.0);
+        for r in &rows {
+            let mut dot = 0.0;
+            for &(j, a) in r {
+                if !pinned(j) {
+                    dot += a * x[j];
+                }
+            }
+            for &(j, a) in r {
+                if !pinned(j) {
+                    out[j] += a * dot;
+                }
+            }
+        }
+    };
+    let mut bvec = vec![0.0f64; nv];
+    for r in &rows {
+        let mut dot = 0.0;
+        for &(j, a) in r {
+            if pinned(j) {
+                dot += a * pin_val(j);
+            }
+        }
+        for &(j, a) in r {
+            if !pinned(j) {
+                bvec[j] -= a * dot;
+            }
+        }
+    }
+    // Conjugate gradient, warm-started from the current UVs mapped onto the pin frame.
+    let (ua, ub) = (m.uvs[ids[pa] as usize], m.uvs[ids[pb] as usize]);
+    let d0 = ub - ua;
+    let den = (d0.length_squared() as f64).max(1e-12);
+    let mut x = vec![0.0f64; nv];
+    for i in 0..n {
+        let z = m.uvs[ids[i] as usize] - ua;
+        // Rotate/scale so the pins land on (0,0) and (dist,0).
+        let (zr, zi) = (z.x as f64, z.y as f64);
+        let (dr, di) = (d0.x as f64, d0.y as f64);
+        let k = dist / den;
+        x[2 * i] = (zr * dr + zi * di) * k;
+        x[2 * i + 1] = (zi * dr - zr * di) * k;
+    }
+    for v in 0..nv {
+        if pinned(v) {
+            x[v] = pin_val(v);
+        }
+    }
+    let mut ax = vec![0.0f64; nv];
+    apply(&x, &mut ax);
+    let mut r: Vec<f64> = (0..nv).map(|i| if pinned(i) { 0.0 } else { bvec[i] - ax[i] }).collect();
+    let mut p = r.clone();
+    let mut rs: f64 = r.iter().map(|v| v * v).sum();
+    let rs0 = rs.max(1e-30);
+    let mut ap = vec![0.0f64; nv];
+    for _ in 0..(4 * nv).clamp(200, 20_000) {
+        if rs < 1e-20 * rs0 || rs < 1e-24 {
+            break;
+        }
+        apply(&p, &mut ap);
+        let pap: f64 = p.iter().zip(&ap).map(|(a, b)| a * b).sum();
+        if pap.abs() < 1e-300 {
+            break;
+        }
+        let alpha = rs / pap;
+        for i in 0..nv {
+            if !pinned(i) {
+                x[i] += alpha * p[i];
+                r[i] -= alpha * ap[i];
+            }
+        }
+        let rs_new: f64 = r.iter().map(|v| v * v).sum();
+        let beta = rs_new / rs;
+        for i in 0..nv {
+            p[i] = if pinned(i) { 0.0 } else { r[i] + beta * p[i] };
+        }
+        rs = rs_new;
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let mut uv: Vec<Vec2> = (0..n).map(|i| Vec2::new(x[2 * i] as f32, x[2 * i + 1] as f32)).collect();
+    // Keep the original orientation (no mirror) and 3D-proportional size.
+    let mut area_uv = 0.0f64;
+    for t in &tris {
+        let (a, b, c) = (uv[t[0]], uv[t[1]], uv[t[2]]);
+        area_uv += ((b - a).perp_dot(c - a) * 0.5) as f64;
+    }
+    if area_uv < 0.0 {
+        for u in uv.iter_mut() {
+            u.y = -u.y;
+        }
+        area_uv = -area_uv;
+    }
+    // Conformal maps keep areas of the same order; a collapse means the solve failed.
+    if area_uv < area3d * 1e-4 {
+        return false;
+    }
+    // Scale to the mesh's texel density and keep the shell where it was.
+    let old_lo = ids.iter().map(|i| m.uvs[*i as usize]).fold(Vec2::splat(f32::MAX), Vec2::min);
+    let target = area3d * density;
+    let k = (target / area_uv.max(1e-30)).sqrt() as f32;
+    let lo = uv.iter().fold(Vec2::splat(f32::MAX), |a, b| a.min(*b));
+    for (i, u) in uv.iter().enumerate() {
+        m.uvs[ids[i] as usize] = old_lo + (*u - lo) * k;
+    }
+    true
+}
+
+/// Mean |log(UV area / 3D area)| deviation from the shell's average ratio — 0 = no stretch.
+pub fn stretch(m: &Mesh) -> f32 {
+    if !m.has_uvs() {
+        return 0.0;
+    }
+    let mut ratios = Vec::new();
+    for (f, fu) in m.faces.iter().zip(&m.face_uvs) {
+        for k in 1..f.len().saturating_sub(1) {
+            let (a, b, c) = (m.positions[f[0] as usize], m.positions[f[k] as usize], m.positions[f[k + 1] as usize]);
+            let a3 = (b - a).cross(c - a).length() * 0.5;
+            let (ua, ub, uc) = (m.uvs[fu[0] as usize], m.uvs[fu[k] as usize], m.uvs[fu[k + 1] as usize]);
+            let a2 = (ub - ua).perp_dot(uc - ua).abs() * 0.5;
+            if a3 > 1e-10 && a2 > 1e-12 {
+                ratios.push((a2 / a3).ln());
+            }
+        }
+    }
+    if ratios.is_empty() {
+        return 0.0;
+    }
+    let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
+    ratios.iter().map(|r| (r - mean).abs()).sum::<f32>() / ratios.len() as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +948,57 @@ mod tests {
         for (x, y) in back[0].1.corner_uvs().iter().flatten().zip(a.corner_uvs().iter().flatten()) {
             assert!((*x - *y).length() < 1e-5);
         }
+    }
+
+    #[test]
+    fn cut_sew_unfold() {
+        // A cylinder with a planar projection from the side is badly stretched on its flanks.
+        let mut m = Primitive::Cylinder { radius: 1.0, height: 2.0, axis_div: 16, height_div: 2, caps: true }.build();
+        planar(&mut m, None, 2);
+        let before = stretch(&m);
+        // Cut a vertical seam (edges whose both ends sit at the max-x... use the +X column).
+        let seam: HashSet<(u32, u32)> = m
+            .edges()
+            .into_iter()
+            .filter(|(a, b)| {
+                let (pa, pb) = (m.positions[*a as usize], m.positions[*b as usize]);
+                pa.z.abs() < 1e-4 && pb.z.abs() < 1e-4 && pa.x > 0.9 && pb.x > 0.9
+            })
+            .map(|(a, b)| ekey(a, b))
+            .collect();
+        assert!(!seam.is_empty());
+        // The caps would keep the side closed: cut around them too.
+        let caps: HashSet<(u32, u32)> = m
+            .edges()
+            .into_iter()
+            .filter(|(a, b)| {
+                let (pa, pb) = (m.positions[*a as usize], m.positions[*b as usize]);
+                (pa.y - pb.y).abs() < 1e-4 && pa.y.abs() > 0.99 && (pa.x * pa.x + pa.z * pa.z) > 0.9 && (pb.x * pb.x + pb.z * pb.z) > 0.9
+            })
+            .map(|(a, b)| ekey(a, b))
+            .collect();
+        let all: HashSet<(u32, u32)> = seam.union(&caps).copied().collect();
+        let n0 = m.uvs.len();
+        let added = cut_edges(&mut m, &all);
+        assert!(added > 0 && m.uvs.len() == n0 + added && m.has_uvs());
+        let shells_n = shells(&m).len();
+        assert!(shells_n >= 3, "side + two caps: {shells_n}");
+        assert_eq!(unfold(&mut m, None), shells_n);
+        let after = stretch(&m);
+        eprintln!("stretch {before:.3} -> {after:.3}");
+        assert!(after < before * 0.25, "unfold removes stretch: {before} -> {after}");
+        // A closed shell is left alone (needs a seam).
+        let mut closed = Primitive::Sphere { radius: 1.0, axis_div: 12, height_div: 8 }.build();
+        planar(&mut closed, None, 2);
+        let snapshot = closed.uvs.clone();
+        assert_eq!(unfold(&mut closed, None), 0);
+        assert_eq!(closed.uvs, snapshot);
+        // Sew the seam back: the side shell closes up again.
+        let sewn = sew_edges(&mut m, &seam);
+        assert!(sewn > 0 && m.has_uvs());
+        assert_eq!(shells(&m).len(), shells_n, "sewing a shell to itself doesn't merge shells");
+        // Sewing caps to the side merges shells.
+        sew_edges(&mut m, &caps);
+        assert_eq!(shells(&m).len(), 1);
     }
 }

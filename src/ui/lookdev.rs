@@ -105,6 +105,29 @@ pub fn material_editor(app: &mut App, ui: &mut egui::Ui, id: u32) {
             ui.add(egui::DragValue::new(&mut m.repeat_uv[1]).speed(0.05).range(0.01..=1000.0));
         });
     }
+    let mut slot_actions: Vec<(crate::look::MapSlot, Option<String>)> = Vec::new();
+    for slot in [crate::look::MapSlot::Normal, crate::look::MapSlot::Roughness, crate::look::MapSlot::Metalness, crate::look::MapSlot::Occlusion, crate::look::MapSlot::Emission] {
+        let cur = m.map(slot).clone();
+        row(ui, slot.label(), &mut |ui| {
+            let label = cur.as_ref().map(|p| std::path::Path::new(p).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or(p.clone())).unwrap_or_else(|| "none".into());
+            ui.label(RichText::new(label).monospace()).on_hover_text(cur.clone().unwrap_or_default());
+            let tip = match slot {
+                crate::look::MapSlot::Normal => "Tangent-space normal map (OpenGL / glTF convention). Shown with Textured (6) and in renders.",
+                crate::look::MapSlot::Roughness => "Greyscale image that multiplies Roughness (set Roughness to 1 for the map's values).",
+                crate::look::MapSlot::Metalness => "Greyscale image that multiplies Metalness (set Metalness to 1 for the map's values).",
+                crate::look::MapSlot::Occlusion => "Greyscale ambient-occlusion map: darkens ambient and bounced light in crevices.",
+                _ => "Colour image that multiplies Incandescence (set Incandescence to white for the map's colours).",
+            };
+            if ui.small_button("File…").on_hover_text(tip).clicked()
+                && let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga"]).pick_file()
+            {
+                slot_actions.push((slot, Some(p.display().to_string())));
+            }
+            if cur.is_some() && ui.small_button("✖").on_hover_text("Disconnect").clicked() {
+                slot_actions.push((slot, None));
+            }
+        });
+    }
     row(ui, "Specular", &mut |ui| {
         ui.add(egui::Slider::new(&mut m.specular, 0.0..=1.0));
     });
@@ -127,7 +150,8 @@ pub fn material_editor(app: &mut App, ui: &mut egui::Ui, id: u32) {
         if let Some(x) = app.material_mut(id) {
             let nm = x.name.clone();
             let map = x.color_map.clone();
-            *x = Material { name: nm, color_map: map, ..m };
+            let (nmap, rmap, mmap, omap, emap) = (x.normal_map.clone(), x.roughness_map.clone(), x.metalness_map.clone(), x.occlusion_map.clone(), x.emission_map.clone());
+            *x = Material { name: nm, color_map: map, normal_map: nmap, roughness_map: rmap, metalness_map: mmap, occlusion_map: omap, emission_map: emap, ..m };
         }
     }
     if reload && let Some(p) = app.material(id).and_then(|x| x.color_map.clone()) {
@@ -138,6 +162,11 @@ pub fn material_editor(app: &mut App, ui: &mut egui::Ui, id: u32) {
         && let Err(e) = app.set_color_map(id, a)
     {
         app.warn(e);
+    }
+    for (slot, a) in slot_actions {
+        if let Err(e) = app.set_material_map(id, slot, a) {
+            app.warn(e);
+        }
     }
 }
 
@@ -347,6 +376,9 @@ pub fn attribute_sections(app: &mut App, ui: &mut egui::Ui, id: NodeId) {
                     ui.add(egui::Slider::new(&mut x.penumbra, 0.0..=45.0).suffix("°"));
                 });
             }
+            if x.kind == LightKind::Area {
+                ui.label(RichText::new("Scale the light to resize it. Soft shadows and falloff appear in the Render View (path tracer).").small().weak());
+            }
             if matches!(x.kind, LightKind::Directional | LightKind::Spot) {
                 ui.checkbox(&mut x.shadows, "Use Depth Map Shadows");
                 if x.shadows {
@@ -374,6 +406,28 @@ pub fn attribute_sections(app: &mut App, ui: &mut egui::Ui, id: NodeId) {
                 ui.add(egui::DragValue::new(&mut x.near).speed(0.01).range(0.0001..=100.0));
                 ui.add(egui::DragValue::new(&mut x.far).speed(10.0).range(1.0..=1.0e6));
             });
+            ui.checkbox(&mut x.dof, "Depth of Field (renders)");
+            if x.dof {
+                ui.horizontal(|ui| {
+                    ui.add_sized([86.0, 18.0], egui::Label::new("F Stop"));
+                    ui.add(egui::DragValue::new(&mut x.fstop).speed(0.05).range(0.5..=128.0).prefix("f/"));
+                    ui.label("Blur ×");
+                    ui.add(egui::DragValue::new(&mut x.blur_scale).speed(0.1).range(0.0..=1000.0)).on_hover_text("Scales the physical blur. Real lenses are subtle at 1 unit = 1 m; raise this for a stronger effect.");
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([86.0, 18.0], egui::Label::new("Focus Distance"));
+                    ui.add(egui::DragValue::new(&mut x.focus_distance).speed(0.02).range(0.001..=1.0e5));
+                    let target = app.sel.iter().copied().find(|s| *s != id);
+                    if ui.add_enabled(target.is_some(), egui::Button::new("Focus on selection").small()).on_hover_text("Select the camera, then the object to focus on (Shift-click)").clicked()
+                        && let Some(t) = target
+                    {
+                        let m = app.scene.world_matrix(id);
+                        let fwd = m.transform_vector3(glam::Vec3::NEG_Z).normalize_or(glam::Vec3::NEG_Z);
+                        let p = app.world_bounds(&[t]).map(|(a, b)| (a + b) * 0.5).unwrap_or(glam::Vec3::ZERO);
+                        x.focus_distance = (p - m.transform_point3(glam::Vec3::ZERO)).dot(fwd).max(0.01);
+                    }
+                });
+            }
             if &x != c {
                 app.edit_checkpoint(egui::Id::unique(("ae_cam", id)));
                 if let Some(Shape::Camera(y)) = app.scene.node_mut(id).map(|n| &mut n.shape) {
@@ -390,7 +444,7 @@ pub fn attribute_sections(app: &mut App, ui: &mut egui::Ui, id: NodeId) {
 }
 
 pub fn lights_menu(app: &mut App, ui: &mut egui::Ui) {
-    for (label, k) in [("Ambient Light", LightKind::Ambient), ("Directional Light", LightKind::Directional), ("Point Light", LightKind::Point), ("Spot Light", LightKind::Spot)] {
+    for (label, k) in [("Ambient Light", LightKind::Ambient), ("Directional Light", LightKind::Directional), ("Point Light", LightKind::Point), ("Spot Light", LightKind::Spot), ("Area Light", LightKind::Area)] {
         if ui.button(label).clicked() {
             app.create_light(k, None);
             if !app.views[app.active_view].all_lights {
@@ -442,7 +496,7 @@ pub fn rendering_shelf(app: &mut App, ui: &mut egui::Ui, button: &mut dyn FnMut(
         create_material_ui(app, MatKind::StandardSurface, true);
     }
     ui.separator();
-    for (l, k) in [("DirLt", LightKind::Directional), ("PointLt", LightKind::Point), ("SpotLt", LightKind::Spot), ("AmbLt", LightKind::Ambient)] {
+    for (l, k) in [("DirLt", LightKind::Directional), ("PointLt", LightKind::Point), ("SpotLt", LightKind::Spot), ("AreaLt", LightKind::Area), ("AmbLt", LightKind::Ambient)] {
         if button(ui, l, k.name(), true) {
             app.create_light(k, None);
         }

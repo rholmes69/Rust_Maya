@@ -119,6 +119,20 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
             let r = app.uv_transform(Vec2::ZERO, Vec2::splat(0.5), 0.0, None, false);
             report(app, r);
         }
+        ui.separator();
+        if ui.button("✂ Cut").on_hover_text("Split UVs along the selected edges (edge mode in the viewport, or UVs along an edge here)").clicked() {
+            let r = app.uv_cut().map(|n| format!("{n} UVs split"));
+            super::report(app, r);
+        }
+        if ui.button("Sew").on_hover_text("Move and sew: join shells along the selected seam edges").clicked() {
+            let r = app.uv_sew().map(|n| format!("{n} edges sewn"));
+            super::report(app, r);
+        }
+        if ui.button("Unfold").on_hover_text("Flatten shells with least-squares conformal mapping (selected UVs' shells, selected faces, or whole meshes)").clicked() {
+            let r = app.uv_unfold().map(|n| format!("{n} shells unfolded"));
+            super::report(app, r);
+        }
+        ui.separator();
         if ui.button("Select Shell").on_hover_text("Grow the UV selection to whole shells (or double-click a UV)").clicked() {
             app.uv_select_shell();
         }
@@ -130,6 +144,12 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         let v = app.active_view;
         ui.checkbox(&mut app.views[v].uv_checker, "UV checker in viewport");
         ui.checkbox(&mut app.views[v].textured, "Textures in viewport (6)");
+        let st: Vec<f32> = targets(app).iter().filter_map(|id| app.scene.node(*id).and_then(|n| n.mesh())).map(crate::uv::stretch).collect();
+        if !st.is_empty() {
+            let v = st.iter().sum::<f32>() / st.len() as f32;
+            let col = if v < 0.1 { Color32::from_rgb(130, 200, 130) } else if v < 0.3 { Color32::from_rgb(230, 190, 90) } else { Color32::from_rgb(230, 120, 90) };
+            ui.label(RichText::new(format!("Stretch {v:.2}")).color(col)).on_hover_text("Average area distortion between 3D and UV (0 = none). Cut seams + Unfold to reduce it.");
+        }
         ui.label(RichText::new("Drag UVs to move · drag empty space to select · Shift adds · MMB/Alt pans · wheel zooms · F frames").small().weak());
     });
 }

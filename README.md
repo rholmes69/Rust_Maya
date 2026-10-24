@@ -118,14 +118,38 @@ MEL: `polyAutoProjection box`, `polyPlanarProjection -md y floor`, `polyCylindri
 `polyLayoutUV`, `polyNormalizeUV`, `polyEditUV -u 0.25 -v 0 -su 2 -sv 2 -a 90`, `polyFlipUV -ft 1`,
 `setAttr wood.colorMap "C:/tex/wood.jpg"`, `setAttr wood.repeatUV 4 4`, `uvChecker on`, `textured off`.
 
+### UV cut, sew and unfold (v1.5)
+
+UV Editor toolbar (or MEL):
+
+- **✂ Cut** (`polyMapCut`) splits UVs along the selected edges. Select them in edge mode in the viewport, or select the UVs along an edge in the UV Editor.
+- **🧵 Sew** (`polyMapSewMove`) joins shells along the selected seam edges, moving, rotating and scaling the other shell onto the edge first.
+- **Unfold** (`u3dUnfold`) flattens shells with Least Squares Conformal Maps (two pinned UVs, conjugate-gradient solve) and keeps the mesh's texel density. A planar-projected cylinder, cut along one seam and around its caps, unfolds with zero area stretch.
+- A **Stretch** readout in the UV Editor shows the remaining distortion.
+
+Scripts can pass edges by index, e.g. `polyMapCut -e 4 9 15 mesh`.
+
+### Normal, roughness, metalness, occlusion and emission maps (v1.4–v1.5)
+
+Materials have five more texture slots next to *Color Map*: **Occlusion Map** (greyscale; darkens ambient and bounced light) and **Emission Map** (colour; multiplies Incandescence), plus the three below.
+Normal, Roughness and Metalness maps: **Normal Map** (tangent space, OpenGL / glTF convention), **Roughness Map** and **Metalness Map** (greyscale images that multiply the Roughness and Metalness values). They show in the viewport with Textured (**6**), where tangents come from screen-space derivatives so meshes need no stored tangents, and in the path tracer, which builds a per-triangle UV tangent frame. glTF import reads `normalTexture` and splits `metallicRoughnessTexture` into the two maps; glTF export writes them back, packing the two maps into G/B; USD export connects them to `UsdPreviewSurface` as raw-colour-space `UsdUVTexture`s.
+
+`setAttr metal.normalMap "C:/tex/panel_n.png"`, `setAttr metal.roughnessMap "C:/tex/panel_r.png"`, `setAttr metal.metalnessMap "C:/tex/panel_m.png"`, `setAttr metal.occlusionMap …`, `setAttr metal.emissionMap …` (`none` disconnects).
+
+glTF import also reads `occlusionTexture`, extracting the R channel since it is often packed with metallic-roughness, and `emissiveTexture`. glTF export writes both, plus per-vertex **TANGENT**s for normal-mapped meshes, and the Khronos validator reports no errors or warnings. USD export connects `occlusion` and `emissiveColor`.
+
+![Damaged Helmet: viewport (left) and path-traced render with the product light rig (right)](docs/texture_maps.png)
+
 ## Export (v0.6)
 
-File › Export All / Export Selection (glTF / USD), or `file -export path.glb|.gltf|.usda [-es] [-na]`:
+File › Export All / Export Selection (glTF / USD), or `file -export path.glb|.gltf|.usda [-es] [-na] [-bp]`:
 
 | Format | What is written |
 |---|---|
-| **glTF 2.0** (`.glb` binary, `.gltf` with an embedded buffer) | Node hierarchy (joint orient folded into rotations), meshes with normals, PBR materials (metallic-roughness, emission, alpha blend), skins (joints + inverse bind matrices, 4 influences), blend shapes as morph targets (with target names), baked animation of every node that moves over the playback range (including motion driven by constraints, IK and driven keys) and of morph weights, `KHR_lights_punctual` lights and perspective cameras. Validated with the Khronos glTF Validator (0 errors). |
-| **USD** (`.usda`) | Xform hierarchy, Mesh, BasisCurves (controls), UsdPreviewSurface materials with bindings, UsdLux lights (DistantLight, SphereLight, spot via ShapingAPI, DomeLight for ambient), Camera, transform animation as time samples, and skinned / blend-shape / cluster meshes **baked as per-frame points**. Opens in `usdview` and any USD-aware DCC. |
+| **glTF 2.0** (`.glb` binary, `.gltf` with an embedded buffer) | Node hierarchy (joint orient folded into rotations), meshes with normals, PBR materials (metallic-roughness, emission, alpha blend, base colour / normal / packed metallic-roughness textures), skins (joints + inverse bind matrices, 4 influences), blend shapes as morph targets (with target names), baked animation of every node that moves over the playback range (including motion driven by constraints, IK and driven keys) and of morph weights, `KHR_lights_punctual` lights and perspective cameras. Validated with the Khronos glTF Validator (0 errors). |
+| **USD** (`.usda`) | Xform hierarchy, Mesh, BasisCurves (controls), UsdPreviewSurface materials with bindings, UsdLux lights (DistantLight, SphereLight, spot via ShapingAPI, DomeLight for ambient), Camera, transform animation as time samples. **Skinned meshes export as UsdSkel** (v1.3): a `SkelRoot` with a `Skeleton` (joint paths, bind and rest transforms), a `SkelAnimation` with per-frame joint translations, rotations and scales (including motion from IK, constraints and controls) and blend-shape weights, plus the mesh with `jointIndices`/`jointWeights`, `geomBindTransform` and `BlendShape` targets. Other deformers (clusters, lattices, wraps, blend-shape-only meshes) are **baked as per-frame points**; turn on File › *USD: bake skinning to points*, or use `-bp`, to bake skinned meshes too. Opens in `usdview` and any USD-aware DCC. |
+
+The UsdSkel output was checked with Pixar's USD (`pip install usd-core`): `tools/check_usdskel.py skel.usda baked.usda` skins every mesh with UsdSkel at every frame and compares it with the point-baked export. A Quick-Rigged walk with an animated blend shape matches to within 0.00001 units over 120 frames, and the stage passes all of USD's validators. `cargo test usdskel_matches -- --ignored` runs the same check.
 
 Not exported: cluster deformers in glTF (glTF has no equivalent), ambient lights in glTF, NURBS-style control curves in glTF.
 
@@ -140,7 +164,7 @@ File › Import (glTF / OBJ)…, drag and drop a file onto the window, or `file 
 | **glTF 2.0** (`.glb`, `.gltf` with embedded, external or data-URI buffers) | Node hierarchy (TRS or matrix), meshes (triangles, strips, fans; vertices welded so edges are connected), UVs, PBR materials with the base-colour texture (embedded images are saved to `<file>_textures/`), skins → joints + skinCluster (exact glTF bind matrices), morph targets → blend shapes (with names and default weights), the first animation (or `-take Walk`) → keyframes on translate/rotate/scale and blend weights (LINEAR, STEP and CUBICSPLINE samplers, sparse accessors), `KHR_lights_punctual` lights and perspective cameras. One undo step. |
 | **OBJ** | Meshes with UVs, plus materials from the `.mtl` (`Kd` colour and `map_Kd` texture). |
 
-Not imported yet: normal, metallic-roughness, occlusion and emissive *maps* (their factors are approximated), orthographic cameras.
+Normal maps and metallic-roughness maps are imported (v1.4); the packed glTF texture is split into roughness and metalness maps. Not imported yet: occlusion and emissive *maps*, orthographic cameras.
 Tested against the Khronos sample models CesiumMan, Fox (3 takes), RiggedFigure, AnimatedMorphCube, BoxAnimated, BoxTextured and DamagedHelmet, and with Rust Maya's own glTF round-trip (rig, skin, blend shape, animation, texture, light, camera).
 
 ## Animation tools (v0.9)
@@ -174,7 +198,12 @@ Status line **🎬** (or Rendering › Render › Render Current Frame, the *Ren
 
 - **Materials:** Lambert / Blinn / Phong / standardSurface colour, specular, roughness (GGX), metalness, incandescence (emissive), transparency and file textures (including the UV checker).
 - **Lights:** directional, point and spot lights (cone + penumbra) with ray-traced shadows, ambient lights, and a sky dome (*Sky*). An empty scene uses a default key light like the viewport.
+  - **Area lights** (v1.4): Create › Lights › Area Light, or `areaLight -w 2 -h 1 -p … -aim …`. A rectangle whose size comes from its scale; it gives soft shadows and natural falloff in renders, and the viewport shows an approximation. The *product* light-rig preset uses three area-light softboxes. USD export writes a `RectLight`; glTF has no area lights, so they are skipped there.
 - **Global illumination:** diffuse and glossy bounces (default 4) with Russian roulette; a *Clamp* setting fights fireflies.
+- **Denoiser** (v1.4, on by default; *Denoise* in the Render View, `renderSettings -dn on|off`): an edge-aware à-trous wavelet filter guided by the first-hit albedo, normals and each pixel's measured variance. It removes most Monte Carlo noise without blurring textures or geometric edges, and keeps mirror reflections sharp. In the tests it cut the error of a 4-samples-per-pixel render by more than 60% in smooth areas, and it takes about 0.35 s on a 640×360 image.
+- **Render passes** (v1.5): the Render View's pass menu shows **Beauty, Albedo, Normal, Depth** (brighter = closer) and **Object ID**. *Save passes…* (or `render … -o shot.png -passes`, `renderView -save shot.png -passes`) writes `shot_beauty.png`, `shot_albedo.png`, …
+- **Render region** (v1.5): Shift-drag a rectangle on the image to re-render only that area; the rest of the previous render stays. IPR keeps updating just the region; *✖ Region* goes back to the full frame (`renderSettings -region 0.25 0.25 0.75 0.75`, `-region off`).
+- **Depth of field** (v1.5): camera Attribute Editor › *Depth of Field*, with **F Stop** and **Focus Distance** (*Focus on selection* measures it) and a **Blur ×** scale, since real lenses are subtle at 1 unit = 1 m. It is a thin-lens model, and `setAttr cam.depthOfField 1; setAttr cam.fStop 2; setAttr cam.focusDistance 7` does the same.
 - **Output:** exposure, sRGB or Filmic (ACES) tone mapping, and a sky or transparent background (PNG alpha). Save… writes a PNG, and **Sequence…** renders a frame range to `name.0001.png …` without blocking the UI.
 
 ```
@@ -184,6 +213,8 @@ renderSettings -x 960 -y 540 -spp 64 -env 0.3 -exp 0.5 -tm filmic -bg env   rend
 ```
 
 ![Render View](docs/render_view.png)
+
+![Depth of field focused on the torus (left) and the albedo / normal / depth / object-ID passes (right)](docs/render_passes.png)
 
 ## Performance (v0.6)
 
@@ -307,8 +338,8 @@ src/
 
 These items appear in the UI as disabled "planned" entries:
 - Deformers: wire
-- Modeling: Quad Draw, UV cut/sew/unfold, normal and other texture maps, NURBS curves and surfaces
-- Area lights, render passes/AOVs and denoising, USD import, UsdSkel export (deformation is baked to points today), FBX
+- Modeling: Quad Draw, UV cut/sew/unfold, NURBS curves and surfaces
+- USD import, FBX, light-path passes (direct / indirect / specular)
 - FX: particles, cloth, fluids
 
 *Not affiliated with Autodesk. Maya is a trademark of Autodesk, Inc.*

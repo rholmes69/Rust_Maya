@@ -307,50 +307,81 @@ pub fn import(app: &mut App, path: &Path, take: Option<&str>) -> Result<Report, 
         mat.metalness = pbr["metallicFactor"].as_f64().unwrap_or(1.0) as f32;
         mat.roughness = pbr["roughnessFactor"].as_f64().unwrap_or(1.0) as f32;
         mat.specular = 1.0;
-        // Maps other than base colour aren't supported yet: approximate their effect.
-        if pbr.get("metallicRoughnessTexture").is_some() {
-            // The factors multiply a texture we can't use; assume a mostly dielectric, mid-rough surface.
-            mat.metalness *= 0.3;
-            mat.roughness *= 0.6;
-            rep.notes.push(format!("{name}: metallic-roughness map approximated"));
-        }
         if let Some(e) = m["emissiveFactor"].as_array() {
             let e: Vec<f32> = e.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
-            if e.len() == 3 && m.get("emissiveTexture").is_none() {
+            if e.len() == 3 {
                 mat.emission = [linear_to_srgb(e[0]), linear_to_srgb(e[1]), linear_to_srgb(e[2])];
-            } else if e.len() == 3 {
-                rep.notes.push(format!("{name}: emissive map ignored"));
             }
         }
-        if let Some(ti) = pbr["baseColorTexture"]["index"].as_u64() {
-            let src = j["textures"][ti as usize]["source"].as_u64();
-            if let Some(src) = src {
-                let p = image_paths.entry(src as usize).or_insert_with(|| match doc.image(src as usize) {
+        // Save a glTF image next to the file once; returns its path.
+        let mut image_file = |tex: &serde_json::Value, rep: &mut Report| -> Option<String> {
+            let ti = tex["index"].as_u64()?;
+            let src = j["textures"][ti as usize]["source"].as_u64()? as usize;
+            image_paths
+                .entry(src)
+                .or_insert_with(|| match doc.image(src) {
                     Ok((bytes, ext)) => {
                         let _ = std::fs::create_dir_all(&tex_dir);
-                        let nm = j["images"][src as usize]["name"].as_str().map(|s| s.replace(['/', '\\', ':'], "_")).unwrap_or(format!("image{src}"));
+                        let nm = j["images"][src]["name"].as_str().map(|s| s.replace(['/', '\\', ':'], "_")).unwrap_or(format!("image{src}"));
                         let file = tex_dir.join(format!("{nm}.{ext}"));
-                        match std::fs::write(&file, bytes) {
-                            Ok(()) => Some(file.display().to_string()),
-                            Err(_) => None,
-                        }
+                        std::fs::write(&file, bytes).ok().map(|_| file.display().to_string())
                     }
                     Err(e) => {
                         rep.notes.push(format!("image {src}: {e}"));
                         None
                     }
-                });
-                if let Some(p) = p.clone() {
-                    // glTF multiplies texture × factor; Maya-style maps replace the colour.
-                    mat.color_map = Some(p);
-                    rep.textures += 1;
+                })
+                .clone()
+        };
+        if let Some(p) = image_file(&pbr["baseColorTexture"], &mut rep) {
+            // glTF multiplies texture × factor; Maya-style maps replace the colour.
+            mat.color_map = Some(p);
+            rep.textures += 1;
+        }
+        if let Some(p) = image_file(&m["normalTexture"], &mut rep) {
+            mat.normal_map = Some(p);
+            rep.textures += 1;
+        }
+        if let Some(p) = image_file(&m["emissiveTexture"], &mut rep) {
+            mat.emission_map = Some(p);
+            if m.get("emissiveFactor").is_none() {
+                // glTF's default factor is black, but a map without a factor is meant to glow.
+                mat.emission = [1.0, 1.0, 1.0];
+            }
+            rep.textures += 1;
+        }
+        // Occlusion is in R (often packed with metallic-roughness): extract it.
+        if let Some(p) = image_file(&m["occlusionTexture"], &mut rep) {
+            match image::open(&p) {
+                Ok(img) => {
+                    let rgb = img.to_rgb8();
+                    let g = image::GrayImage::from_fn(rgb.width(), rgb.height(), |x, y| image::Luma([rgb.get_pixel(x, y)[0]]));
+                    let out = format!("{}_occlusion.png", std::path::Path::new(&p).with_extension("").display());
+                    if g.save(&out).is_ok() {
+                        mat.occlusion_map = Some(out);
+                        rep.textures += 1;
+                    }
                 }
+                Err(e) => rep.notes.push(format!("{name}: occlusion map unreadable ({e})")),
             }
         }
-        if let Some(t) = m["normalTexture"].as_object()
-            && !t.is_empty()
-        {
-            rep.notes.push(format!("{name}: normal map ignored"));
+        // glTF packs roughness in G and metalness in B: split into two greyscale maps.
+        if let Some(p) = image_file(&pbr["metallicRoughnessTexture"], &mut rep) {
+            match image::open(&p) {
+                Ok(img) => {
+                    let rgb = img.to_rgb8();
+                    let stem_p = std::path::Path::new(&p).with_extension("");
+                    let chan = |c: usize, suffix: &str| -> Option<String> {
+                        let g = image::GrayImage::from_fn(rgb.width(), rgb.height(), |x, y| image::Luma([rgb.get_pixel(x, y)[c]]));
+                        let out = format!("{}_{suffix}.png", stem_p.display());
+                        g.save(&out).ok().map(|_| out)
+                    };
+                    mat.roughness_map = chan(1, "roughness");
+                    mat.metalness_map = chan(2, "metalness");
+                    rep.textures += 2;
+                }
+                Err(e) => rep.notes.push(format!("{name}: metallic-roughness map unreadable ({e})")),
+            }
         }
         *app.material_mut(id).unwrap() = mat;
         mats.push(id);
@@ -422,7 +453,7 @@ pub fn import(app: &mut App, path: &Path, take: Option<&str>) -> Result<Report, 
             let c = &j["cameras"][ci as usize];
             if c["type"].as_str() == Some("perspective") {
                 let yfov = c["perspective"]["yfov"].as_f64().unwrap_or(0.8) as f32;
-                let cam = CameraShape { focal: 12.0 / (yfov / 2.0).tan(), near: c["perspective"]["znear"].as_f64().unwrap_or(0.1) as f32, far: c["perspective"]["zfar"].as_f64().unwrap_or(10000.0) as f32 };
+                let cam = CameraShape { focal: 12.0 / (yfov / 2.0).tan(), near: c["perspective"]["znear"].as_f64().unwrap_or(0.1) as f32, far: c["perspective"]["zfar"].as_f64().unwrap_or(10000.0) as f32, ..Default::default() };
                 set_shape(app, ids[i], Shape::Camera(cam));
                 rep.cameras += 1;
             } else {

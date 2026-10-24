@@ -88,7 +88,7 @@ impl App {
         if let RenderCam::Node(id) = cam
             && let Some(Shape::Camera(cs)) = self.scene.node(id).map(|n| n.shape.clone())
         {
-            return RtCamera::from_node(self.scene.world_matrix(id), cs.fov_y());
+            return RtCamera::from_node(self.scene.world_matrix(id), &cs);
         }
         RtCamera::from_view(&self.views[self.active_view].cam)
     }
@@ -136,8 +136,10 @@ impl App {
             j.cancel();
         }
         let settings = self.render.settings.clone();
+        // A region render keeps the previous image outside the region.
+        let base = settings.region.and_then(|_| self.render.job.as_ref().filter(|j| j.size() == (settings.width, settings.height)).map(|j| j.final_linear()));
         self.render.job_key = (gen_key, cam.key(), settings.key());
-        self.render.job = Some(RenderJob::start(scene, cam, settings));
+        self.render.job = Some(RenderJob::start_with_base(scene, cam, settings, base));
         self.render.open = true;
     }
 
@@ -229,9 +231,19 @@ impl App {
         self.render.job.as_ref().is_some_and(|j| !j.is_done())
     }
 
-    pub fn save_render(&self, path: &str) -> Result<(), String> {
-        let job = self.render.job.as_ref().ok_or("Nothing rendered yet.")?;
+    pub fn save_render(&mut self, path: &str) -> Result<(), String> {
+        let denoise = self.render.settings.denoise;
+        let job = self.render.job.as_mut().ok_or("Nothing rendered yet.")?;
+        job.settings.denoise = denoise;
         job.save_png(std::path::Path::new(path), self.render.settings.exposure, self.render.settings.tonemap)
+    }
+
+    /// Save beauty, albedo, normal, depth and object-ID images next to `path`.
+    pub fn save_render_passes(&mut self, path: &str) -> Result<Vec<String>, String> {
+        let denoise = self.render.settings.denoise;
+        let job = self.render.job.as_mut().ok_or("Nothing rendered yet.")?;
+        job.settings.denoise = denoise;
+        job.save_passes(std::path::Path::new(path), self.render.settings.exposure, self.render.settings.tonemap)
     }
 }
 

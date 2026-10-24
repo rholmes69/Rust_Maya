@@ -57,11 +57,85 @@ pub struct Material {
     pub color_map: Option<String>,
     /// place2dTexture repeatUV.
     pub repeat_uv: [f32; 2],
+    /// Tangent-space normal map (OpenGL convention, +Y up).
+    #[serde(default)]
+    pub normal_map: Option<String>,
+    /// Greyscale roughness map (multiplies `roughness`).
+    #[serde(default)]
+    pub roughness_map: Option<String>,
+    /// Greyscale metalness map (multiplies `metalness`).
+    #[serde(default)]
+    pub metalness_map: Option<String>,
+    /// Greyscale ambient-occlusion map (darkens ambient / indirect light).
+    #[serde(default)]
+    pub occlusion_map: Option<String>,
+    /// Colour map that multiplies `emission` (incandescence).
+    #[serde(default)]
+    pub emission_map: Option<String>,
+}
+
+/// Texture slots of a material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapSlot {
+    Color,
+    Normal,
+    Roughness,
+    Metalness,
+    Occlusion,
+    Emission,
+}
+
+impl MapSlot {
+    pub fn label(self) -> &'static str {
+        match self {
+            MapSlot::Color => "Color Map",
+            MapSlot::Normal => "Normal Map",
+            MapSlot::Roughness => "Roughness Map",
+            MapSlot::Metalness => "Metalness Map",
+            MapSlot::Occlusion => "Occlusion Map",
+            MapSlot::Emission => "Emission Map",
+        }
+    }
+    /// MEL attribute names.
+    pub fn parse(attr: &str) -> Option<MapSlot> {
+        Some(match attr {
+            "colorMap" | "fileTextureName" | "texture" | "baseColorMap" => MapSlot::Color,
+            "normalMap" | "normalCamera" | "bumpMap" => MapSlot::Normal,
+            "roughnessMap" | "specularRoughnessMap" => MapSlot::Roughness,
+            "metalnessMap" | "metallicMap" => MapSlot::Metalness,
+            "occlusionMap" | "aoMap" | "ambientOcclusionMap" => MapSlot::Occlusion,
+            "emissionMap" | "incandescenceMap" | "emissiveMap" => MapSlot::Emission,
+            _ => return None,
+        })
+    }
+}
+
+impl Material {
+    pub fn map(&self, slot: MapSlot) -> &Option<String> {
+        match slot {
+            MapSlot::Color => &self.color_map,
+            MapSlot::Normal => &self.normal_map,
+            MapSlot::Roughness => &self.roughness_map,
+            MapSlot::Metalness => &self.metalness_map,
+            MapSlot::Occlusion => &self.occlusion_map,
+            MapSlot::Emission => &self.emission_map,
+        }
+    }
+    pub fn map_mut(&mut self, slot: MapSlot) -> &mut Option<String> {
+        match slot {
+            MapSlot::Color => &mut self.color_map,
+            MapSlot::Normal => &mut self.normal_map,
+            MapSlot::Roughness => &mut self.roughness_map,
+            MapSlot::Metalness => &mut self.metalness_map,
+            MapSlot::Occlusion => &mut self.occlusion_map,
+            MapSlot::Emission => &mut self.emission_map,
+        }
+    }
 }
 
 impl Default for Material {
     fn default() -> Self {
-        Material { id: 0, name: "lambert2".into(), kind: MatKind::Lambert, color: [0.5, 0.5, 0.5], specular: 0.0, roughness: 0.5, metalness: 0.0, emission: [0.0; 3], transparency: 0.0, color_map: None, repeat_uv: [1.0, 1.0] }
+        Material { id: 0, name: "lambert2".into(), kind: MatKind::Lambert, color: [0.5, 0.5, 0.5], specular: 0.0, roughness: 0.5, metalness: 0.0, emission: [0.0; 3], transparency: 0.0, color_map: None, repeat_uv: [1.0, 1.0], normal_map: None, roughness_map: None, metalness_map: None, occlusion_map: None, emission_map: None }
     }
 }
 
@@ -115,7 +189,7 @@ impl Material {
                 };
                 self.transparency = if attr == "opacity" { 1.0 - t } else { t }.clamp(0.0, 1.0);
             }
-            _ => return Err(format!("Unknown material attribute '{attr}' (color, colorMap, repeatUV, specular, roughness, metalness, incandescence, transparency)")),
+            _ => return Err(format!("Unknown material attribute '{attr}' (color, colorMap, normalMap, roughnessMap, metalnessMap, repeatUV, specular, roughness, metalness, incandescence, transparency)")),
         }
         Ok(())
     }
@@ -130,6 +204,11 @@ impl Material {
             "incandescence" | "emission" => c(self.emission),
             "transparency" => self.transparency.to_string(),
             "colorMap" | "fileTextureName" => self.color_map.clone().unwrap_or_default(),
+            "normalMap" | "normalCamera" => self.normal_map.clone().unwrap_or_default(),
+            "roughnessMap" => self.roughness_map.clone().unwrap_or_default(),
+            "metalnessMap" => self.metalness_map.clone().unwrap_or_default(),
+            "occlusionMap" => self.occlusion_map.clone().unwrap_or_default(),
+            "emissionMap" | "incandescenceMap" => self.emission_map.clone().unwrap_or_default(),
             "repeatUV" => format!("{} {}", self.repeat_uv[0], self.repeat_uv[1]),
             _ => return None,
         })
@@ -144,6 +223,8 @@ pub enum LightKind {
     Directional,
     Point,
     Spot,
+    /// Rectangular area light: a 2×2 quad in local XY emitting down -Z (scale to resize).
+    Area,
 }
 
 impl LightKind {
@@ -153,6 +234,7 @@ impl LightKind {
             LightKind::Directional => "directionalLight",
             LightKind::Point => "pointLight",
             LightKind::Spot => "spotLight",
+            LightKind::Area => "areaLight",
         }
     }
 }
@@ -207,11 +289,19 @@ pub struct CameraShape {
     pub focal: f32,
     pub near: f32,
     pub far: f32,
+    /// Depth of field in renders (thin lens).
+    pub dof: bool,
+    /// Aperture f-number (lower = shallower focus).
+    pub fstop: f32,
+    /// Distance to the plane in focus (scene units, along the view axis).
+    pub focus_distance: f32,
+    /// Multiplies the physical blur (1 unit = 1 m makes real lenses subtle at room scale).
+    pub blur_scale: f32,
 }
 
 impl Default for CameraShape {
     fn default() -> Self {
-        CameraShape { focal: 35.0, near: 0.1, far: 10_000.0 }
+        CameraShape { focal: 35.0, near: 0.1, far: 10_000.0, dof: false, fstop: 5.6, focus_distance: 5.0, blur_scale: 1.0 }
     }
 }
 
@@ -227,7 +317,11 @@ impl CameraShape {
             "nearClipPlane" | "ncp" => self.near = x.max(1e-4),
             "farClipPlane" | "fcp" => self.far = x.max(self.near + 1e-3),
             "fieldOfView" | "fov" => self.focal = 12.0 / (x.to_radians() / 2.0).tan(),
-            _ => return Err(format!("Unknown camera attribute '{attr}' (focalLength, nearClipPlane, farClipPlane)")),
+            "depthOfField" | "dof" => self.dof = x > 0.5,
+            "fStop" | "fs" => self.fstop = x.clamp(0.5, 128.0),
+            "focusDistance" | "fd" => self.focus_distance = x.max(1e-3),
+            "dofBlurScale" | "blurScale" => self.blur_scale = x.clamp(0.0, 1000.0),
+            _ => return Err(format!("Unknown camera attribute '{attr}' (focalLength, nearClipPlane, farClipPlane, depthOfField, fStop, focusDistance)")),
         }
         Ok(())
     }
@@ -281,6 +375,17 @@ pub fn icon_lines(shape: &Shape) -> Vec<(Vec3, Vec3)> {
                     l.push((Vec3::ZERO, Vec3::new(a.cos() * r, a.sin() * r, -len)));
                 }
                 l.push((Vec3::ZERO, Vec3::new(0.0, 0.0, -len * 1.5)));
+            }
+            LightKind::Area => {
+                let c = [Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 1.0, 0.0)];
+                for i in 0..4 {
+                    l.push((c[i], c[(i + 1) % 4]));
+                }
+                l.push((c[0], c[2]));
+                l.push((c[1], c[3]));
+                l.push((Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0)));
+                l.push((Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.12, 0.0, -0.75)));
+                l.push((Vec3::new(0.0, 0.0, -1.0), Vec3::new(-0.12, 0.0, -0.75)));
             }
             LightKind::Ambient => {
                 circle(&mut l, 0.4, 0.0, 16);
@@ -344,9 +449,26 @@ impl App {
                 LightKind::Ambient => 0.0,
                 LightKind::Directional => 1.0,
                 LightKind::Point => 2.0,
-                LightKind::Spot => 3.0,
+                LightKind::Spot | LightKind::Area => 3.0,
             };
             let idx = g.lights.len();
+            if li.kind == LightKind::Area {
+                // Viewport: a hemispherical "spot" at the centre (soft front-facing falloff);
+                // the path tracer gets the real rectangle.
+                let ex = m.transform_vector3(Vec3::X);
+                let ey = m.transform_vector3(Vec3::Y);
+                g.area_lights.push((pos, ex, ey, dir, [lc[0] * li.intensity, lc[1] * li.intensity, lc[2] * li.intensity]));
+                // No distance falloff in the viewport: scale by solid angle at the scene centre.
+                let k = if have_bounds {
+                    let d2 = (pos - (lo + hi) * 0.5).length_squared().max(1e-4);
+                    (4.0 * ex.cross(ey).length() / d2).min(1.0)
+                } else {
+                    1.0
+                };
+                let i = li.intensity * k;
+                g.lights.push(GpuLight { pos: [pos.x, pos.y, pos.z, kind], dir: [dir.x, dir.y, dir.z, -0.05], col: [lc[0] * i, lc[1] * i, lc[2] * i, 0.5] });
+                continue;
+            }
             g.lights.push(GpuLight {
                 pos: [pos.x, pos.y, pos.z, kind],
                 dir: [dir.x, dir.y, dir.z, outer.cos()],
@@ -484,6 +606,10 @@ impl App {
                     n.rotate = aim_euler(-n.translate);
                 }
                 LightKind::Ambient => n.translate = Vec3::new(0.0, 3.0, 0.0),
+                LightKind::Area => {
+                    n.translate = Vec3::new(3.0, 5.0, 4.0);
+                    n.rotate = aim_euler(-n.translate);
+                }
             }
         }
         self.sel = vec![id];

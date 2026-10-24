@@ -13,7 +13,7 @@ pub const LIGHT_PRESETS: [(&str, &str); 6] = [
     ("outdoor", "Daylight: high sun with shadows plus blue sky fill"),
     ("sunset", "Golden hour: low orange sun, purple ambient"),
     ("night", "Moonlight: dim blue moon plus a warm practical lamp"),
-    ("product", "Product shot: soft key and fill, top light, bright sky"),
+    ("product", "Product shot: soft area-light key, fill and top light, bright sky"),
     ("dramatic", "Low-key: one hard side light and a rim, little fill"),
 ];
 
@@ -80,6 +80,14 @@ impl App {
             format!("directionalLight -n {n} -p {} -aim {aim} -i {:.3} -rgb {} {} {}{}", fmt_v(c + from * d), i * k, rgb[0], rgb[1], rgb[2], if sh { " -sh on" } else { "" })
         };
         let point = |n: &str, p: Vec3, i: f32, rgb: [f32; 3]| format!("pointLight -n {n} -p {} -i {:.3} -rgb {} {} {}", fmt_v(p), i * k, rgb[0], rgb[1], rgb[2]);
+        // Softbox: an area light 1.6× the subject radius on a side, intensity normalised so the
+        // subject receives about `i` (area lights fall off with distance).
+        let area = |n: &str, p: Vec3, i: f32, rgb: [f32; 3]| {
+            let side = r * 1.6;
+            let dist = (p - c).length();
+            let norm = dist * dist / (side * side);
+            format!("areaLight -n {n} -p {} -aim {aim} -w {side:.3} -h {side:.3} -i {:.3} -rgb {} {} {}", fmt_v(p), i * k * norm, rgb[0], rgb[1], rgb[2])
+        };
         let amb = |n: &str, i: f32, rgb: [f32; 3]| format!("ambientLight -n {n} -i {:.3} -rgb {} {} {}", i * k, rgb[0], rgb[1], rgb[2]);
         let (lights, env): (Vec<String>, f32) = match preset.as_str() {
             "studio" => (
@@ -102,9 +110,9 @@ impl App {
             ),
             "product" => (
                 vec![
-                    spot("key_light", c + dir(35.0, 30.0) * d, 0.9, [1.0, 1.0, 1.0], true, 30.0),
-                    spot("fill_light", c + dir(-45.0, 20.0) * d, 0.55, [1.0, 1.0, 1.0], false, 30.0),
-                    spot("top_light", c + Vec3::Y * d, 0.5, [1.0, 1.0, 1.0], false, 30.0),
+                    area("key_light", c + dir(35.0, 30.0) * d, 1.0, [1.0, 1.0, 1.0]),
+                    area("fill_light", c + dir(-50.0, 20.0) * d, 0.5, [1.0, 1.0, 1.0]),
+                    area("top_light", c + Vec3::Y * d, 0.5, [1.0, 1.0, 1.0]),
                     amb("bounce_light", 0.08, [1.0, 1.0, 1.0]),
                 ],
                 0.5,
@@ -494,7 +502,7 @@ impl App {
         s.spp = spp;
         s.env_background = false;
         let job = self.render_now(cam, s.clone())?;
-        let lin = job.linear();
+        let lin = job.final_linear();
         let rgba = crate::raytrace::tonemap(&lin, s.exposure, s.tonemap);
         let default_light = !self.scene.nodes.iter().any(|n| matches!(&n.shape, Shape::Light(l) if l.kind != crate::look::LightKind::Ambient) && self.scene.is_visible(n.id));
         let unshaded = self.scene.nodes.iter().filter(|n| n.mesh().is_some() && n.material.is_none() && self.scene.is_visible(n.id)).count();

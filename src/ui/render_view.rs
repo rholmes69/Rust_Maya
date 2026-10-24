@@ -1,14 +1,16 @@
 //! Render View window: progressive CPU path-traced renders of the active view or a camera.
 
 use crate::app::App;
-use crate::raytrace::ToneMap;
+use crate::raytrace::{Pass, ToneMap};
 use crate::render_view::RenderCam;
 use crate::scene::Shape;
 use eframe::egui::{self, Color32, RichText};
 
 pub struct RenderViewUi {
     tex: Option<egui::TextureHandle>,
-    shown: (u64, f32, ToneMap, usize),
+    shown: (u64, f32, ToneMap, usize, bool, Pass),
+    pass: Pass,
+    region_start: Option<egui::Pos2>,
     last_update: std::time::Instant,
     seq_start: i32,
     seq_end: i32,
@@ -21,7 +23,9 @@ impl Default for RenderViewUi {
     fn default() -> Self {
         RenderViewUi {
             tex: None,
-            shown: (u64::MAX, 0.0, ToneMap::Srgb, 0),
+            shown: (u64::MAX, 0.0, ToneMap::Srgb, 0, false, Pass::Beauty),
+            pass: Pass::Beauty,
+            region_start: None,
             last_update: std::time::Instant::now(),
             seq_start: 1,
             seq_end: 24,
@@ -100,6 +104,12 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui, st: &mut RenderViewUi) {
         ui.add(egui::DragValue::new(&mut s.spp).range(1..=16384).speed(4.0));
         ui.label("Bounces");
         ui.add(egui::DragValue::new(&mut s.bounces).range(0..=32));
+        if ui.add_enabled(app.render.job.is_some(), egui::Button::new("Save passes…")).on_hover_text("Beauty, albedo, normal, depth and object-ID PNGs").clicked()
+            && let Some(p) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name("render.png").save_file()
+        {
+            let r = app.save_render_passes(&p.to_string_lossy()).map(|f| format!("Saved {} passes ({} …)", f.len(), f.first().cloned().unwrap_or_default()));
+            super::report(app, r);
+        }
         if ui.selectable_label(st.seq_open, "Sequence…").on_hover_text("Render an image sequence").clicked() {
             st.seq_open ^= true;
             if st.seq_path.is_empty() {
@@ -121,9 +131,25 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui, st: &mut RenderViewUi) {
         ui.label("Sky");
         ui.add(egui::Slider::new(&mut s.env, 0.0..=2.0).step_by(0.05));
         ui.checkbox(&mut s.env_background, "Sky background");
+        ui.checkbox(&mut s.denoise, "Denoise").on_hover_text("Edge-aware denoiser guided by albedo and normals (applied to the display and saved images)");
         ui.label("Clamp");
         ui.add(egui::DragValue::new(&mut s.clamp).range(0.1..=1000.0).speed(0.1));
         ui.checkbox(&mut st.zoom_fit, "Fit");
+        egui::ComboBox::from_id_salt("rv_pass").selected_text(st.pass.name()).show_ui(ui, |ui| {
+            for p in Pass::ALL {
+                ui.selectable_value(&mut st.pass, p, p.name());
+            }
+        });
+        match app.render.settings.region {
+            Some(_) => {
+                if ui.button("✖ Region").on_hover_text("Render the whole frame again").clicked() {
+                    app.render.settings.region = None;
+                }
+            }
+            None => {
+                ui.label(RichText::new("Shift-drag: render region").small().weak());
+            }
+        }
     });
     if st.seq_open {
         ui.horizontal_wrapped(|ui| {
@@ -153,7 +179,9 @@ fn image(app: &mut App, ui: &mut egui::Ui, st: &mut RenderViewUi) {
     // Status line.
     let mut status = String::new();
     let mut progress = None;
+    let denoise = app.render.settings.denoise;
     if let Some(job) = app.render.job.as_mut() {
+        job.settings.denoise = denoise;
         let (w, h) = job.size();
         let done = job.is_done();
         let secs = job.elapsed().as_secs_f32();
@@ -167,11 +195,12 @@ fn image(app: &mut App, ui: &mut egui::Ui, st: &mut RenderViewUi) {
         }
         // Refresh the image at most ~6×/s while rendering (and on exposure / tone-map edits).
         let id = job.id as usize;
-        let key = (job.version(), exp, tm, id);
+        let key = (job.version(), exp, tm, id, denoise, st.pass);
         let stale = key != st.shown;
-        let due = st.last_update.elapsed().as_secs_f32() > 0.16 || done || key.1 != st.shown.1 || key.2 != st.shown.2;
+        let interval = if denoise { 0.7 } else { 0.16 };
+        let due = st.last_update.elapsed().as_secs_f32() > interval || done || key.1 != st.shown.1 || key.2 != st.shown.2 || key.4 != st.shown.4 || key.5 != st.shown.5;
         if stale && due {
-            let rgba = job.rgba8(exp, tm);
+            let rgba = job.pass_rgba8(st.pass, exp, tm);
             let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
             match &mut st.tex {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
@@ -194,7 +223,7 @@ fn image(app: &mut App, ui: &mut egui::Ui, st: &mut RenderViewUi) {
         }
     });
     let avail = ui.available_size();
-    let (rect, _) = ui.allocate_exact_size(avail.max(egui::vec2(64.0, 64.0)), egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(avail.max(egui::vec2(64.0, 64.0)), egui::Sense::drag());
     let painter = ui.painter_at(rect);
     // Checkerboard behind transparent pixels.
     painter.rect_filled(rect, 0.0, Color32::from_rgb(30, 30, 30));
@@ -219,5 +248,27 @@ fn image(app: &mut App, ui: &mut egui::Ui, st: &mut RenderViewUi) {
         row += 1;
     }
     painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+    // Render region: Shift-drag on the image.
+    let to_norm = |p: egui::Pos2| egui::pos2(((p.x - r.left()) / r.width()).clamp(0.0, 1.0), ((p.y - r.top()) / r.height()).clamp(0.0, 1.0));
+    let shift = ui.input(|i| i.modifiers.shift);
+    if resp.drag_started() && shift {
+        st.region_start = resp.interact_pointer_pos();
+    }
+    let mut live: Option<egui::Rect> = None;
+    if let (Some(a), Some(b)) = (st.region_start, resp.interact_pointer_pos()) {
+        live = Some(egui::Rect::from_two_pos(a, b));
+        if resp.drag_stopped() {
+            st.region_start = None;
+            let (na, nb) = (to_norm(a), to_norm(b));
+            if (nb.x - na.x).abs() > 0.01 && (nb.y - na.y).abs() > 0.01 {
+                app.render.settings.region = Some([na.x.min(nb.x), na.y.min(nb.y), na.x.max(nb.x), na.y.max(nb.y)]);
+                app.start_render();
+            }
+        }
+    }
+    let reg = live.or_else(|| app.render.settings.region.map(|[x0, y0, x1, y1]| egui::Rect::from_min_max(egui::pos2(r.left() + x0 * r.width(), r.top() + y0 * r.height()), egui::pos2(r.left() + x1 * r.width(), r.top() + y1 * r.height()))));
+    if let Some(rr) = reg {
+        painter.rect_stroke(rr, 0.0, egui::Stroke::new(1.5, Color32::from_rgb(255, 210, 60)), egui::StrokeKind::Middle);
+    }
 }
 

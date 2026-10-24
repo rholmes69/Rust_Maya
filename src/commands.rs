@@ -29,12 +29,14 @@ Commands (MEL-style, separate with ';'):
   viewSet -persp|-top|-front|-side   viewFit [-all]   panelLayout -single|-quad
   displayMode -wire|-shaded|-wos    xray [on|off]    lighting -all|-default [-shadows on|off]
 Export:
-  file -export path.glb|path.gltf|path.usda|path.obj [-es (selected only)] [-na (no animation)]
+  file -export path.glb|path.gltf|path.usda|path.obj [-es (selected only)] [-na (no animation)] [-bp (USD: bake points instead of UsdSkel)]
   file -import path.glb|path.gltf|path.obj [-take animName]   (glTF: hierarchy, meshes+UVs, materials+textures, skins, blend shapes, animation, lights, cameras)
 UVs and textures:
   polyPlanarProjection [-md x|y|z|b] | polyCylindricalProjection | polySphericalProjection | polyAutoProjection  [objects]
+  polyMapCut [-e edgeIdx...] [mesh] (cut along selected edges)   polyMapSewMove [-e ...] (move & sew)   u3dUnfold [mesh] (LSCM unfold)
   polyLayoutUV | polyNormalizeUV | polyEditUV [-u du] [-v dv] [-su s] [-sv s] [-a deg] [-pu u -pv v] | polyFlipUV [-ft 0|1]
-  setAttr mat.colorMap \"C:/tex/wood.png\" | checker | none      setAttr mat.repeatUV 2 2      uvChecker on|off   textured on|off   uvEditor
+  setAttr mat.colorMap \"C:/tex/wood.png\" | checker | none      setAttr mat.repeatUV 2 2
+  setAttr mat.normalMap \"C:/tex/n.png\"   setAttr mat.roughnessMap \"C:/tex/r.png\"   setAttr mat.metalnessMap \"C:/tex/m.png\"   (none disconnects)      uvChecker on|off   textured on|off   uvEditor
 Animation tools:
   keyTangent [-t frame] -itt|-ott auto|spline|linear|flat|step [objects]    copyKey [objs]   pasteKey [-t frame] [objs]
   ghost [on|off] [-st step] [objects]   motionTrail [on|off] [objects]   dopeSheet
@@ -53,12 +55,14 @@ Recipes:
   renderCheck [-x 320 -y 180 -spp 16] [-cam camera]   (preview render + exposure/framing/lighting report)
 Rendering (CPU path tracer):
   render [-x 960 -y 540] [-spp 64] [-b 4] [-cam camera] [-o file.png]   render -seq -st 1 -e 24 -o C:/out/name
-  renderSettings [-x W -y H -spp N -b N -env sky -exp stops -tm srgb|filmic -bg env|black -clamp 4 -cam cam|-av]
-  renderView [-ipr on|off] [-stop] [-save file.png]
+  renderSettings [-x W -y H -spp N -b N -env sky -exp stops -tm srgb|filmic -bg env|black -clamp 4 -dn on|off -cam cam|-av]
+  renderView [-ipr on|off] [-stop] [-save file.png [-passes]]   render ... -o file.png -passes (beauty/albedo/normal/depth/objectid)
+  renderSettings -region x0 y0 x1 y1 (0..1, top-left) | -region off
 Look dev:
   shadingNode -asShader lambert|blinn|phong|standardSurface -n name [-rgb r g b]
   setAttr mat.color r g b | mat.specular | mat.roughness | mat.metalness | mat.incandescence r g b | mat.transparency
   hyperShade -assign mat [objects]   sets -e -forceElement matSG objects   hyperShade (opens the window)
+  areaLight [-w 2 -h 2] [-i I] [-rgb r g b] [-p x y z] [-aim x y z] [-n name]   (soft rectangular light; render view)
   directionalLight|pointLight|spotLight|ambientLight [-i I] [-rgb r g b] [-ca cone] [-sh on] [-p x y z] [-rot x y z] [-aim x y z] [-n name]
   setAttr light.intensity | light.color r g b | light.coneAngle | light.useDepthMapShadows 1
   camera [-fl 35] [-p x y z] [-aim x y z] [-n name]   lookThru cam|persp   setAttr cam.focalLength 50
@@ -444,7 +448,7 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 return Ok(String::new());
             }
             if let Some((node, attr)) = spec.split_once('.')
-                && matches!(attr, "colorMap" | "fileTextureName" | "texture")
+                && let Some(slot) = crate::look::MapSlot::parse(attr)
             {
                 let mid = app.material_by_name(node).ok_or(format!("No material named '{node}'"))?;
                 let v = a.positional.get(1).cloned().unwrap_or_default();
@@ -452,7 +456,7 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                     "" | "none" | "off" => None,
                     p => Some(p.to_string()),
                 };
-                app.set_color_map(mid, path)?;
+                app.set_material_map(mid, slot, path)?;
                 return Ok(String::new());
             }
             let nums: Vec<f32> = a.positional[1..]
@@ -683,6 +687,9 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 let mut opts = crate::export::ExportOptions::from_app(app, sel);
                 if a.has("noAnim") || a.has("na") {
                     opts.animation = false;
+                }
+                if a.has("bakePoints") || a.has("bp") {
+                    opts.usd_skel = false;
                 }
                 crate::export::export_path(app, &p, &opts)
             } else {
@@ -1114,6 +1121,38 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             let t = a.f(&["t", "time"], app.scene.time);
             Ok(format!("{}", app.paste_keys(t)))
         }
+        "polyMapCut" | "polyMapSew" | "polyMapSewMove" | "u3dUnfold" | "unfold" | "polyUnfold" => {
+            // Optional: -e edgeIndex... selects those edges of the (named or selected) mesh.
+            let toks: Vec<String> = rest.to_vec();
+            let mut eidx: Vec<u32> = Vec::new();
+            let mut objs: Vec<String> = Vec::new();
+            let mut in_e = false;
+            for t in &toks {
+                if t == "-e" || t == "-edges" {
+                    in_e = true;
+                } else if in_e && let Ok(v) = t.parse::<u32>() {
+                    eidx.push(v);
+                } else if !t.starts_with('-') {
+                    in_e = false;
+                    objs.push(t.clone());
+                }
+            }
+            if !objs.is_empty() {
+                app.sel = resolve(app, &objs)?;
+            }
+            if !eidx.is_empty() {
+                let id = *app.sel.first().ok_or("select a mesh")?;
+                let all = app.scene.node(id).and_then(|n| n.mesh()).map(|m| m.edges()).ok_or("not a polygon mesh")?;
+                let edges: Vec<(u32, u32)> = eidx.iter().filter_map(|i| all.get(*i as usize).copied()).collect();
+                app.select_edges(id, &edges, false);
+            }
+            let r = match cmd.as_str() {
+                "polyMapCut" => app.uv_cut().map(|n| format!("{n} UVs split")),
+                "polyMapSew" | "polyMapSewMove" => app.uv_sew().map(|n| format!("{n} edges sewn")),
+                _ => app.uv_unfold().map(|n| format!("{n} shells unfolded")),
+            };
+            r
+        }
         "lightRig" => {
             let toks: Vec<String> = rest.to_vec();
             let val = |f: &str| toks.iter().position(|t| t == f).and_then(|i| toks.get(i + 1)).cloned();
@@ -1245,6 +1284,14 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             if let Some(v) = val("-tm").or(val("-tonemap")) {
                 s.tonemap = crate::render_view::parse_tonemap(&v).ok_or_else(|| format!("Unknown tone map '{v}' (srgb, filmic)"))?;
             }
+            if flag("-region") || flag("-reg") {
+                let i = toks.iter().position(|t| t == "-region" || t == "-reg").unwrap();
+                let nums: Vec<f32> = toks.iter().skip(i + 1).take(4).filter_map(|t| t.parse().ok()).collect();
+                s.region = if nums.len() == 4 { Some([nums[0], nums[1], nums[2], nums[3]]) } else { None };
+            }
+            if let Some(v) = val("-dn").or(val("-denoise")) {
+                s.denoise = matches!(v.as_str(), "on" | "1" | "true");
+            }
             if let Some(v) = val("-bg").or(val("-background")) {
                 s.env_background = matches!(v.as_str(), "env" | "sky" | "environment" | "on" | "1");
             }
@@ -1266,6 +1313,9 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                     return Ok(String::new());
                 }
                 if let Some(p) = val("-save").map(quote) {
+                    if flag("-passes") {
+                        return Ok(app.save_render_passes(&p)?.join(" "));
+                    }
                     app.save_render(&p)?;
                     return Ok(p);
                 }
@@ -1290,6 +1340,10 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             }
             if let Some(out) = val("-o").map(quote) {
                 let job = app.render_now(cam.as_deref(), s.clone())?;
+                if flag("-passes") {
+                    let files = job.save_passes(std::path::Path::new(&out), s.exposure, s.tonemap)?;
+                    return Ok(files.join(" "));
+                }
                 job.save_png(std::path::Path::new(&out), s.exposure, s.tonemap)?;
                 let mut job = job;
                 return Ok(format!("{}x{} {} spp in {:.2}s → {out}", s.width, s.height, s.spp, job.elapsed().as_secs_f32()));
@@ -1528,12 +1582,13 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             }
             Ok(format!("{mat_name} assigned to {n} object(s)"))
         }
-        "directionalLight" | "pointLight" | "spotLight" | "ambientLight" => {
+        "directionalLight" | "pointLight" | "spotLight" | "ambientLight" | "areaLight" => {
             use crate::look::LightKind as L;
             let kind = match cmd.as_str() {
                 "directionalLight" => L::Directional,
                 "pointLight" => L::Point,
                 "spotLight" => L::Spot,
+                "areaLight" => L::Area,
                 _ => L::Ambient,
             };
             let name = a.get("n").or(a.get("name")).map(String::from);
@@ -1556,6 +1611,10 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             }
             if let Some(t) = aim_flag {
                 app.aim_at(id, t);
+            }
+            if kind == L::Area {
+                let (w, h) = (a.f(&["w", "width"], 2.0), a.f(&["h", "height"], 2.0));
+                app.scene.node_mut(id).unwrap().scale = Vec3::new((w * 0.5).max(1e-3), (h * 0.5).max(1e-3), 1.0);
             }
             Ok(app.scene.node(id).unwrap().name.clone())
         }

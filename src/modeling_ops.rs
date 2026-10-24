@@ -15,7 +15,7 @@ impl App {
         m
     }
 
-    fn selected_edges(&self) -> HashMap<NodeId, Vec<Edge>> {
+    pub(crate) fn selected_edges(&self) -> HashMap<NodeId, Vec<Edge>> {
         let mut out = HashMap::new();
         if self.comp_mode != CompMode::Edge {
             return out;

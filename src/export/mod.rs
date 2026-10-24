@@ -19,11 +19,14 @@ pub struct ExportOptions {
     pub bake_deformation: bool,
     /// Destination file (USD writes the UV-checker texture next to it when used).
     pub out_path: Option<std::path::PathBuf>,
+    /// USD: export skinned meshes as UsdSkel (Skeleton + SkelAnimation + joint weights)
+    /// instead of baked point samples.
+    pub usd_skel: bool,
 }
 
 impl ExportOptions {
     pub fn from_app(app: &App, selected_only: bool) -> Self {
-        ExportOptions { selected_only, animation: true, start: app.scene.play_start, end: app.scene.play_end, bake_deformation: true, out_path: None }
+        ExportOptions { selected_only, animation: true, start: app.scene.play_start, end: app.scene.play_end, bake_deformation: true, out_path: None, usd_skel: !app.usd_bake_points }
     }
 }
 
@@ -169,7 +172,7 @@ mod tests {
         let u = execute(&mut app, &format!("file -export {}", dir.join("rm_char.usda").display())).unwrap();
         eprintln!("{g}\n{u}");
         assert!(g.contains("1 skins") && g.contains("animation channels"));
-        assert!(u.contains("baked as point samples"));
+        assert!(u.contains("UsdSkel: 1 skeleton(s)"), "{u}");
         // The wrist moves in the baked animation (driven through IK), so it gets a rotation channel chain.
         let (doc, _) = gltf::parse_glb(&std::fs::read(dir.join("rm_char.glb")).unwrap());
         let n_ch = doc["animations"][0]["channels"].as_array().unwrap().len();

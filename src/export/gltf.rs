@@ -105,6 +105,10 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
         }
         let (bytes, mime) = if name == crate::texture::CHECKER {
             (Some(crate::texture::TexImage::checker().to_png()), "image/png")
+        } else if let Some(pair) = name.strip_prefix("mr:") {
+            // glTF metallicRoughness: roughness in G, metalness in B.
+            let (r, m) = pair.split_once('|').unwrap_or((pair, ""));
+            (pack_metal_rough(r, m), "image/png")
         } else {
             let ext = std::path::Path::new(name).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
             match ext.as_str() {
@@ -149,6 +153,24 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
                 });
                 if let Some(t) = tex {
                     v["pbrMetallicRoughness"]["baseColorTexture"] = json!({ "index": t, "texCoord": 0 });
+                }
+                if let Some(t) = m.normal_map.as_ref().and_then(|t| texture_for(t, bin, images, textures, notes)) {
+                    v["normalTexture"] = json!({ "index": t, "texCoord": 0 });
+                }
+                if let Some(t) = m.occlusion_map.as_ref().and_then(|t| texture_for(t, bin, images, textures, notes)) {
+                    v["occlusionTexture"] = json!({ "index": t, "texCoord": 0 });
+                }
+                if let Some(t) = m.emission_map.as_ref().and_then(|t| texture_for(t, bin, images, textures, notes)) {
+                    v["emissiveTexture"] = json!({ "index": t, "texCoord": 0 });
+                    if !m.emission.iter().any(|x| *x > 0.0) {
+                        v["emissiveFactor"] = json!([1.0, 1.0, 1.0]);
+                    }
+                }
+                if m.roughness_map.is_some() || m.metalness_map.is_some() {
+                    let key = format!("mr:{}|{}", m.roughness_map.clone().unwrap_or_default(), m.metalness_map.clone().unwrap_or_default());
+                    if let Some(t) = texture_for(&key, bin, images, textures, notes) {
+                        v["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({ "index": t, "texCoord": 0 });
+                    }
                 }
                 if m.emission.iter().any(|x| *x > 0.0) {
                     v["emissiveFactor"] = json!(lin3(m.emission));
@@ -230,6 +252,42 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
                 });
                 if has_uv {
                     attrs["TEXCOORD_0"] = json!(bin.floats(&uvs, "VEC2", 2, Some(ARRAY_BUFFER), false));
+                    // Tangents for normal-mapped materials (per-vertex, accumulated from triangles
+                    // in glTF's UV space; w = bitangent sign).
+                    if n.material.and_then(|m| app.material(m)).is_some_and(|m| m.normal_map.is_some()) {
+                        let nv = corner_vert.len();
+                        let mut tacc = vec![Vec3::ZERO; nv];
+                        let mut bacc = vec![Vec3::ZERO; nv];
+                        let p3 = |i: usize| Vec3::new(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+                        let t2 = |i: usize| glam::Vec2::new(uvs[i * 2], uvs[i * 2 + 1]);
+                        for t in idx.chunks_exact(3) {
+                            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+                            let (e1, e2) = (p3(b) - p3(a), p3(c) - p3(a));
+                            let (d1, d2) = (t2(b) - t2(a), t2(c) - t2(a));
+                            let det = d1.x * d2.y - d2.x * d1.y;
+                            if det.abs() < 1e-12 {
+                                continue;
+                            }
+                            let r = 1.0 / det;
+                            let tu = (e1 * d2.y - e2 * d1.y) * r;
+                            let tv = (e2 * d1.x - e1 * d2.x) * r;
+                            for k in [a, b, c] {
+                                tacc[k] += tu;
+                                bacc[k] += tv;
+                            }
+                        }
+                        let mut tan: Vec<f32> = Vec::with_capacity(nv * 4);
+                        for k in 0..nv {
+                            let nn = Vec3::new(nrm[k * 3], nrm[k * 3 + 1], nrm[k * 3 + 2]);
+                            let mut t = (tacc[k] - nn * nn.dot(tacc[k])).normalize_or_zero();
+                            if t == Vec3::ZERO {
+                                t = nn.any_orthonormal_vector();
+                            }
+                            let w = if nn.cross(t).dot(bacc[k]) < 0.0 { -1.0 } else { 1.0 };
+                            tan.extend_from_slice(&[t.x, t.y, t.z, w]);
+                        }
+                        attrs["TANGENT"] = json!(bin.floats(&tan, "VEC4", 4, Some(ARRAY_BUFFER), false));
+                    }
                 }
                 // Skin.
                 if let Some(sk) = n.skin.as_ref().filter(|sk| sk.weights.len() == mesh.positions.len()) {
@@ -294,7 +352,7 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
                         let outer = ((l.cone * 0.5) + l.penumbra.max(0.1)).to_radians().clamp(inner + 1e-3, std::f32::consts::FRAC_PI_2);
                         lv["spot"] = json!({ "innerConeAngle": inner.min(outer - 1e-3), "outerConeAngle": outer });
                     }
-                    LightKind::Ambient => {
+                    LightKind::Ambient | LightKind::Area => {
                         skipped_ambient += 1;
                         lv = Value::Null;
                     }
@@ -412,6 +470,20 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
 }
 
 /// Binary glTF (.glb).
+/// Combine greyscale roughness / metalness maps into a glTF metallicRoughness PNG
+/// (G = roughness, B = metalness; a missing map is white so the factor applies unchanged).
+fn pack_metal_rough(rough: &str, metal: &str) -> Option<Vec<u8>> {
+    let load = |p: &str| if p.is_empty() { None } else { image::open(p).ok().map(|i| i.to_luma8()) };
+    let (r, m) = (load(rough), load(metal));
+    let (w, h) = r.as_ref().or(m.as_ref()).map(|i| i.dimensions())?;
+    let fit = |img: Option<image::GrayImage>| img.map(|i| if i.dimensions() == (w, h) { i } else { image::imageops::resize(&i, w, h, image::imageops::FilterType::Triangle) });
+    let (r, m) = (fit(r), fit(m));
+    let out = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([0, r.as_ref().map(|i| i.get_pixel(x, y)[0]).unwrap_or(255), m.as_ref().map(|i| i.get_pixel(x, y)[0]).unwrap_or(255)]));
+    let mut buf = std::io::Cursor::new(Vec::new());
+    out.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(buf.into_inner())
+}
+
 pub fn export(app: &App, opts: &ExportOptions) -> Result<(Vec<u8>, String), String> {
     let (doc, data, summary) = build(app, opts)?;
     let mut js = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;

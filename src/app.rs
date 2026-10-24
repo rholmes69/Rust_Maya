@@ -273,6 +273,8 @@ pub struct App {
     pub panels_uv_editor: bool,
     pub panels_dope_sheet: bool,
     pub render: crate::render_view::RenderViewState,
+    /// USD export: bake skinned meshes to point samples instead of UsdSkel.
+    pub usd_bake_points: bool,
     pub panels_pose_lib: bool,
     pub panels_retarget: bool,
     /// Selected keys (Graph Editor / Dope Sheet).
@@ -401,6 +403,7 @@ impl App {
             panels_uv_editor: false,
             panels_dope_sheet: false,
             render: Default::default(),
+            usd_bake_points: false,
             panels_pose_lib: false,
             panels_retarget: false,
             key_sel: Vec::new(),
@@ -1692,6 +1695,19 @@ impl App {
             let mat = node.material.and_then(|m| self.material(m)).cloned();
             let layer = mat.as_ref().and_then(|m| m.color_map.clone()).and_then(|t| self.texture_layer(&t)).map(|l| l as f32 + 1.0).unwrap_or(0.0);
             let repeat = mat.as_ref().map(|m| Vec2::from(m.repeat_uv)).unwrap_or(Vec2::ONE);
+            let mut maps = [0.0f32; 4];
+            if let Some(m) = &mat {
+                for (k, slot) in [crate::look::MapSlot::Normal, crate::look::MapSlot::Roughness, crate::look::MapSlot::Metalness].into_iter().enumerate() {
+                    if let Some(t) = m.map(slot).clone() {
+                        maps[k] = self.texture_layer(&t).map(|l| l as f32 + 1.0).unwrap_or(0.0);
+                    }
+                }
+                // w packs occlusion (low) and emission (high) layers + 1.
+                let lay = |app: &mut App, s: crate::look::MapSlot| m.map(s).clone().and_then(|t| app.texture_layer(&t)).map(|l| l as u32 + 1).unwrap_or(0);
+                let ao = lay(self, crate::look::MapSlot::Occlusion);
+                let em = lay(self, crate::look::MapSlot::Emission);
+                maps[3] = (ao + em * 1024) as f32;
+            }
             let (color, mparams, emi, alpha) = match &mat {
                 Some(m) => (m.color, [m.specular, m.roughness, m.metalness, layer], [m.emission[0], m.emission[1], m.emission[2], 0.0], 1.0 - m.transparency),
                 None => (color, GpuVertex::DEFAULT_MAT, [0.0; 4], 1.0),
@@ -1734,7 +1750,7 @@ impl App {
                             Some(t) => (*t * repeat, 1.0),
                             None => (Vec2::ZERO, 0.0),
                         };
-                        GpuVertex { pos: wp.to_array(), nrm: n.to_array(), col: [c[0], c[1], c[2], alpha], mat: mparams, emi: [emi[0], emi[1], emi[2], has], uv: uv.to_array() }
+                        GpuVertex { pos: wp.to_array(), nrm: n.to_array(), col: [c[0], c[1], c[2], alpha], mat: mparams, emi: [emi[0], emi[1], emi[2], has], uv: uv.to_array(), maps }
                     };
                     tri_v = crate::mesh::par_map(tri.pos.len(), &corner);
                 }

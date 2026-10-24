@@ -60,6 +60,7 @@ LOOK DEV (materials are SHARED: editing one changes every object it is assigned 
   hyperShade -assign mat obj1 obj2 ...      (setColor gives an object its own colour and removes its material)
   directionalLight|pointLight|spotLight|ambientLight -n name [-i intensity] [-rgb r g b] [-p x y z] [-aim x y z] [-rot x y z] [-ca cone] [-sh on]
       lights shine down their -Z axis; use -aim to point them; "-sh on" casts shadows (directional/spot)
+  areaLight -n softbox -w 2 -h 1 -i 3 -p x y z -aim x y z   soft rectangular light (soft shadows in renders; falls off with distance)
   setAttr light.intensity 2   light.color r g b   light.coneAngle 40   light.useDepthMapShadows 1
   camera -n name [-fl focalMM] -p x y z -aim x y z     lookThru name | lookThru persp
   lighting -all -shadows on   (viewport: use scene lights + shadows)    lighting -default    xray on|off
@@ -67,6 +68,8 @@ UVS & TEXTURES (primitives already have UVs; topology edits like bevel may drop 
   polyAutoProjection obj | polyPlanarProjection -md x|y|z|b obj | polyCylindricalProjection obj | polySphericalProjection obj
   polyLayoutUV obj   polyNormalizeUV obj   polyEditUV -u 0.5 -v 0 [-su 2 -sv 2] [-a 90] obj   polyFlipUV -ft 0 obj
   setAttr mat.colorMap "C:/path/image.png" (or checker)   setAttr mat.repeatUV 4 4   uvChecker on|off   uvEditor
+  setAttr mat.normalMap "C:/path/n.png"   setAttr mat.roughnessMap "C:/path/r.png"   setAttr mat.metalnessMap "C:/path/m.png" (greyscale, multiply)
+  setAttr mat.occlusionMap path   setAttr mat.emissionMap path   polyMapCut -e edgeIdx... obj   polyMapSewMove -e edgeIdx... obj   u3dUnfold obj
 ANIMATION TOOLS: keyTangent -t 12 -ott spline|linear|flat|step|auto obj   copyKey obj; pasteKey -t 50 obj
   ghost on obj (onion skin)   motionTrail on obj   poseLibrary -save name [-h] | -apply name [-w 0.5] [-key] [-mirror]
   retarget -src sourceRootJoint -dst targetRootJoint [-s 1] [-e 48]   (copies an imported/animated skeleton's motion onto another rig)
@@ -84,7 +87,9 @@ RECIPES (tuned one-liners — PREFER these for lighting, materials and character
       Quick Rigs the mesh if there is no rig yet, then keys the *_ctrl controls procedurally
   renderCheck   renders a small preview and reports exposure / framing / lighting problems with suggested fixes
 RENDER: render [-x 960 -y 540] [-spp 64] [-cam cameraName] [-o C:/path/out.png]   (CPU path tracer → Render View; -o saves a still)
-  render -seq -st 1 -e 24 -o C:/path/name   renderSettings -spp 128 -env 0.3 -exp 0.5 -tm filmic -bg env   renderView -ipr on|off
+  render -o C:/path/shot.png -passes (beauty/albedo/normal/depth/objectid)   renderSettings -region 0.2 0.2 0.6 0.6 | -region off
+  camera depth of field: setAttr cam.depthOfField 1; setAttr cam.fStop 2.8; setAttr cam.focusDistance 6; setAttr cam.dofBlurScale 20
+  render -seq -st 1 -e 24 -o C:/path/name   renderSettings -spp 128 -env 0.3 -exp 0.5 -tm filmic -bg env -dn on   renderView -ipr on|off
 IMPORT: file -import C:/path/model.glb [-take Walk] | .gltf | .obj   (brings in meshes, materials/textures, skins, blend shapes, animation)
 EXPORT: file -export C:/path/scene.glb | .gltf | .usda | .obj  [-es selected only] [-na no animation]
   (glTF keeps skins, blend shapes, baked animation, lights, cameras; USD bakes deformation to point samples)"#;
