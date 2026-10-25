@@ -299,6 +299,9 @@ impl Shell {
                     let r = app.bevel_selected(w);
                     report(app, r);
                 }
+                (Key::Backspace, _, _, _) if matches!(app.tool, Tool::CurveCv | Tool::CurveEp) && !app.curve_tool.points.is_empty() => {
+                    app.curve_tool.points.pop();
+                }
                 (Key::Delete, _, _, _) | (Key::Backspace, _, _, _) => app.delete_selected(),
                 (Key::Escape, _, _, _) => {
                     app.interact.drag = None;
@@ -309,6 +312,19 @@ impl Shell {
                         app.cut_points.clear();
                         app.info("Multi-Cut cancelled");
                     }
+                    if !app.curve_tool.points.is_empty() {
+                        app.curve_tool.points.clear();
+                        app.info("Curve cancelled");
+                    }
+                }
+                (Key::Enter, false, _, _) if matches!(app.tool, Tool::CurveCv | Tool::CurveEp) => {
+                    let r = app.finish_curve_tool().map(|id| id.and_then(|i| app.scene.node(i)).map(|n| format!("Created {}", n.name)).unwrap_or_default());
+                    report(app, r);
+                }
+                (Key::Enter, false, _, _) if app.tool == Tool::QuadDraw => {
+                    app.qd_finish();
+                    app.tool = Tool::Select;
+                    app.info("Quad Draw finished");
                 }
                 (Key::Enter, false, _, _) if app.tool == Tool::Joint => app.finish_joint_chain(),
                 (Key::Enter, false, _, _) if app.tool == Tool::MultiCut => {

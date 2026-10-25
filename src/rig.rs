@@ -190,6 +190,8 @@ pub fn has_deformers(scene: &Scene, id: NodeId) -> bool {
         || !n.clusters.is_empty()
         || !n.lattices.is_empty()
         || n.wrap.as_ref().is_some_and(|w| w.binds.len() == nv)
+        || !n.wires.is_empty()
+        || n.cloth.as_ref().is_some_and(|c| c.current().is_some_and(|p| p.len() == nv))
 }
 
 /// Deformed world positions (deformer order: blend shape → skin → clusters), or None if the
@@ -246,6 +248,11 @@ fn deformed_positions_depth(scene: &Scene, id: NodeId, depth: u32) -> Option<Vec
             });
             crate::deform::wrap_apply(&dw, &wb.binds, &mut world);
         }
+    }
+    crate::deform::apply_wires(scene, &n.wires, &mut world);
+    // Cloth: the simulated points replace everything above (which is the cloth's rest input).
+    if let Some(p) = n.cloth.as_ref().and_then(|c| c.current()).filter(|p| p.len() == nv) {
+        world.copy_from_slice(p);
     }
     Some(world)
 }
@@ -553,6 +560,8 @@ pub struct DrivenKey {
 
 /// Evaluate driven keys, constraints and IK handles (call after animation evaluation).
 pub fn evaluate(scene: &mut Scene) {
+    // Surfaces built from curves follow their inputs (construction history).
+    crate::nurbs::update_history(scene);
     // Driven keys.
     let mut sets = Vec::new();
     for n in &scene.nodes {
@@ -623,6 +632,8 @@ pub fn evaluate(scene: &mut Scene) {
         let pole = pole.filter(|p| scene.node(*p).is_some()).map(|p| world_pos(scene, p));
         solve_ik_twist(scene, s, e, goal, pole, twist);
     }
+    // Simulations (particles, cloth) catch up to the current frame.
+    crate::fx::update(scene);
 }
 
 // ------------------------------------------------------------------------ joint orient

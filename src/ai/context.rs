@@ -41,6 +41,11 @@ pub fn scene_summary(app: &App) -> String {
             break;
         }
         let kind = match &n.shape {
+            Shape::Particles(ps) => {
+                let st = &ps.settings;
+                let src = st.source.and_then(|i| sc.node(i)).map(|x| format!(" from {}", x.name)).unwrap_or_default();
+                format!("particle system ({} emitter{src}, rate {:.0}/s, speed {:.2}, lifespan {:.1}s, {} live particles)", st.kind.name(), st.rate, st.speed, st.lifespan, ps.current().len())
+            }
             Shape::Group => "group".to_string(),
             Shape::Locator => "locator".to_string(),
             Shape::Joint { .. } => format!("joint (orient {})", v3(n.joint_orient)),
@@ -57,10 +62,17 @@ pub fn scene_summary(app: &App) -> String {
                 if l.shadows { ", shadows" } else { "" }, v3(crate::rig::world_rotation(sc, n.id) * Vec3::NEG_Z)),
             Shape::Lattice { div, .. } => format!("lattice ({}x{}x{} points)", div[0], div[1], div[2]),
             Shape::Camera(c) => format!("camera (focal {:.0} mm, looks {})", c.focal, v3(crate::rig::world_rotation(sc, n.id) * Vec3::NEG_Z)),
-            Shape::Curve { closed, .. } => format!("nurbsCurve control ({})", if *closed { "closed" } else { "open" }),
-            Shape::Poly { history, mesh, .. } => match history {
-                Some(p) => format!("poly{} ({} faces)", p.base_name(), mesh.face_count()),
-                None => format!("mesh ({} faces)", mesh.face_count()),
+            Shape::Curve { closed, degree, points, .. } => {
+                let len = crate::nurbs::world_curve(sc, n.id).map(|c| c.length()).unwrap_or(0.0);
+                format!("nurbsCurve ({}, degree {degree}, {} CVs, length {len:.2})", if *closed { "closed" } else { "open" }, points.len())
+            }
+            Shape::Poly { history, mesh, .. } => match (history, &n.surf) {
+                (Some(p), _) => format!("poly{} ({} faces)", p.base_name(), mesh.face_count()),
+                (None, Some(h)) => {
+                    let ins: Vec<String> = h.inputs.iter().filter_map(|i| sc.node(*i)).map(|x| x.name.clone()).collect();
+                    format!("mesh from {} of {} ({} faces, live history)", h.op_name(), ins.join(", "), mesh.face_count())
+                }
+                (None, None) => format!("mesh ({} faces)", mesh.face_count()),
             },
         };
         let world = sc.world_matrix(n.id).transform_point3(Vec3::ZERO);
@@ -97,6 +109,14 @@ pub fn scene_summary(app: &App) -> String {
         }
         if let Some(w) = n.wrap.as_ref().and_then(|w| sc.node(w.driver)) {
             s.push_str(&format!(", wrapped to {}", w.name));
+        }
+        if let Some(c) = &n.cloth {
+            let col: Vec<&str> = c.settings.colliders.iter().filter_map(|i| sc.node(*i)).map(|x| x.name.as_str()).collect();
+            s.push_str(&format!(", nCloth (stretch {:.2}, bend {:.2}, {} pinned vertices, colliders [{}])", c.settings.stretch, c.settings.bend, c.settings.pins.len(), col.join(", ")));
+        }
+        if !n.wires.is_empty() {
+            let w: Vec<String> = n.wires.iter().filter_map(|b| sc.node(b.curve).map(|c| format!("{} (dropoff {:.2})", c.name, b.dropoff))).collect();
+            s.push_str(&format!(", wires [{}]", w.join(", ")));
         }
         for c in &n.constraints {
             let d: Vec<&str> = c.drivers.iter().filter_map(|j| sc.node(*j)).map(|j| j.name.as_str()).collect();
@@ -215,6 +235,7 @@ fn shape_kind(s: &Shape) -> &'static str {
         Shape::Light(l) => l.kind.name(),
         Shape::Camera(_) => "camera",
         Shape::Lattice { .. } => "lattice",
+        Shape::Particles(_) => "particles",
         Shape::Curve { .. } => "curve",
         Shape::Poly { history: Some(p), .. } => p.base_name(),
         Shape::Poly { .. } => "mesh",

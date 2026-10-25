@@ -48,6 +48,33 @@ Modeling tools:
   sculpt [-b sculpt|smooth|grab|flatten|inflate|pinch] [-s 0..1] [-r pixels] [-sym on|off] [-inv on|off]
   lattice [-dv 2 5 2] [-n name] [objects]   latticePoint lat i j k x y z   lattice -e -reset lat   lattice -rm objects
   wrap [-d driver] targets...   (or select targets, then the driver last)
+  setToolTo cvCurve|epCurve|quadDraw
+Components:
+  select obj.vtx[0:3] | obj.e[5] | obj.f[*] | crv.cv[2] [-add|-d]   then move|rotate|scale [-r] x y z (no names)
+  pointPosition obj.vtx[i] | crv.cv[i]   (world position)
+Curves (NURBS):
+  curve [-d 3] -p x y z -p x y z ... [-per] [-n name]   curve -ep x y z -ep ... (through points)
+  circle [-r 1] [-s 8] [-nr 0 1 0] [-c x y z] [-p x y z] [-n name]   (NURBS circle; -p places the node)
+  rebuildCurve [-s spans] [-d degree] [crvs]   reverseCurve [crvs]   closeCurve [crvs]   attachCurve a b
+  detachCurve crv.u[param] | detachCurve -pf 0.5 crv
+Surfaces (polygon meshes with history):
+  revolve [-ax 0 1 0] [-p pivot] [-s 8] [-ssw 0] [-esw 360] [-sp samples] [-ch on|off] [-n name] profiles
+  loft [-ss 1] [-c] [-n name] curves   extrude [-n name] profile [path] | extrude -l 2 [-dir x y z] profile
+  planarSrf [-n name] closedCurve
+Wire deformer:
+  wire -w curve [-dds 0 dist] [-en 1] [-rot 1] meshes   wire -e -w curve [-dds 0 dist] [-en v] [-rot v]
+Quad Draw (retopology):
+  makeLive mesh | makeLive -n   quadDraw (tool)   quadDraw -dot x y z   quadDraw -quad i j k l | -tri i j k
+  quadDraw -extend a b dx dy dz | -relax N | -moveDot i x y z | -deleteFace f | -deleteDot i | -new | -finish
+FX (simulate as the time slider plays; cached per frame):
+  emitter [-type omni|dir|surface|curve|volume] [-r rate] [-spd speed] [-srn 0..1] [-sp spreadDeg] [-dir x y z]
+          [-lifespan s] [-lsr 0..1] [-rad r] [-rgb r g b] [-p x y z] [-n name] [sourceMeshOrCurve]
+  setAttr p.rate|speed|spread|lifespan|drag|turbulence|turbulenceFrequency|bounce|friction|radius|seed|startFrame v
+  setAttr p.gravity|wind|direction|color|colorEnd x y z   getAttr p.count
+  nCloth [-stretch 1] [-bend 0.1] [-thickness t] meshes   removeNCloth meshes
+  clothPin [-to node] mesh.vtx[0:10] ...   clothPin -clear mesh
+  setAttr cloth.stretch|bend|damping|drag|thickness|friction|substeps|iterations|startFrame v   setAttr cloth.wind x y z
+  connectDynamic -c colliderMesh particlesOrCloth   connectDynamic -d colliderMesh target
 Recipes:
   lightRig -preset studio|outdoor|sunset|night|product|dramatic [-i 1] [-target objects]   (replaces the lightRig group)
   materialPreset -p gold|silver|chrome|copper|brass|brushed_metal|plastic|rubber|glass|water|wood|concrete|marble|ceramic|car_paint|skin|fabric|neon|grass [-rgb r g b] [-n name] [objects]
@@ -198,7 +225,7 @@ impl Args {
     }
 }
 
-fn resolve(app: &App, names: &[String]) -> Result<Vec<NodeId>, String> {
+pub(crate) fn resolve(app: &App, names: &[String]) -> Result<Vec<NodeId>, String> {
     let mut out = Vec::new();
     for n in names {
         let matches: Vec<NodeId> = app.scene.nodes.iter().filter(|nd| wildcard(n, &nd.name)).map(|nd| nd.id).collect();
@@ -214,7 +241,7 @@ fn resolve(app: &App, names: &[String]) -> Result<Vec<NodeId>, String> {
     Ok(out)
 }
 
-fn targets(app: &App, names: &[String]) -> Result<Vec<NodeId>, String> {
+pub(crate) fn targets(app: &App, names: &[String]) -> Result<Vec<NodeId>, String> {
     if names.is_empty() { Ok(app.sel.clone()) } else { resolve(app, names) }
 }
 
@@ -302,8 +329,52 @@ fn rig_split(app: &App, ids: &[NodeId]) -> (Vec<NodeId>, Vec<NodeId>) {
     ids.iter().partition(|id| app.is_joint(**id))
 }
 
+/// `name.cv[3]`, `name.vtx[0:4]`, `name.e[*]`, `name.f[2]` → (node, mode, indices).
+type CompSpec = (NodeId, CompMode, Vec<u32>);
+
+fn parse_component(app: &App, spec: &str) -> Option<Result<CompSpec, String>> {
+    let (node, rest) = spec.split_once('.')?;
+    let (kind, range) = rest.split_once('[')?;
+    let range = range.strip_suffix(']')?;
+    let mode = match kind {
+        "cv" | "vtx" | "pt" => CompMode::Vertex,
+        "e" => CompMode::Edge,
+        "f" => CompMode::Face,
+        _ => return None,
+    };
+    Some((|| {
+        let id = app.scene.find_by_name(node).ok_or_else(|| format!("No object matches name: {node}"))?;
+        let n = app.scene.node(id).unwrap();
+        let count = match mode {
+            CompMode::Vertex => n.points().map(|p| p.len()).unwrap_or(0),
+            CompMode::Edge => n.mesh().map(|m| m.edges().len()).unwrap_or(0),
+            _ => n.mesh().map(|m| m.face_count()).unwrap_or(0),
+        };
+        if count == 0 {
+            return Err(format!("{node} has no {kind} components"));
+        }
+        let (a, b) = match range {
+            "*" | ":" => (0, count - 1),
+            r => match r.split_once(':') {
+                Some((x, y)) => (x.trim().parse::<usize>().map_err(|_| format!("bad range {r}"))?, y.trim().parse::<usize>().map_err(|_| format!("bad range {r}"))?),
+                None => {
+                    let i = r.trim().parse::<usize>().map_err(|_| format!("bad index {r}"))?;
+                    (i, i)
+                }
+            },
+        };
+        if a > b || b >= count {
+            return Err(format!("{spec}: index out of range (0..{})", count - 1));
+        }
+        Ok((id, mode, (a as u32..=b as u32).collect()))
+    })())
+}
+
 fn run(app: &mut App, stmt: &str) -> Result<String, String> {
     let mut tokens = tokenize(stmt);
+    if let Some(r) = crate::curve_ops::mel(app, &tokens).or_else(|| crate::quad_draw::mel(app, &tokens)).or_else(|| crate::fx::mel(app, &tokens)) {
+        return r;
+    }
     let pos_flag = take_vec3(&mut tokens, &["p", "position"]);
     let normal_flag = take_vec3(&mut tokens, &["nr", "normal"]);
     let aim_flag = take_vec3(&mut tokens, &["aim", "aimVector"]);
@@ -392,6 +463,43 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 app.select_all();
                 return Ok(names(app, &app.sel.clone()));
             }
+            // Components: select ring.cv[0:3] pCube1.vtx[2] ...
+            let comps: Vec<&String> = a.positional.iter().filter(|p| p.contains('[')).collect();
+            if !comps.is_empty() {
+                let mut parsed = Vec::new();
+                for c in &comps {
+                    parsed.push(parse_component(app, c).ok_or_else(|| format!("Unknown component '{c}'"))??);
+                }
+                let mode = parsed[0].1;
+                if parsed.iter().any(|p| p.1 != mode) {
+                    return Err("select: mix of component types".into());
+                }
+                let keep = a.has("add") || a.has("tgl");
+                for (id, _, _) in &parsed {
+                    if !app.sel.contains(id) {
+                        app.sel.push(*id);
+                    }
+                }
+                if !keep {
+                    app.sel.retain(|s| parsed.iter().any(|p| p.0 == *s));
+                }
+                if app.comp_mode != mode {
+                    app.comp_mode = mode;
+                    app.comp_sel.clear();
+                } else if !keep {
+                    app.comp_sel.clear();
+                }
+                for (id, _, idx) in parsed {
+                    for i in idx {
+                        if a.has("d") || a.has("deselect") {
+                            app.comp_sel.remove(&(id, i));
+                        } else {
+                            app.comp_sel.insert((id, i));
+                        }
+                    }
+                }
+                return Ok(format!("{} components", app.comp_sel.len()));
+            }
             let ids = resolve(app, &a.positional)?;
             if a.has("add") {
                 for id in ids {
@@ -417,11 +525,22 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 return Err(format!("{cmd}: expected 3 values"));
             }
             let v = Vec3::new(nums[0], nums[1], nums[2]);
+            let rel = a.has("r") || a.has("relative") || a.has("by");
+            // Component mode: move / rotate / scale the selected points (curve CVs, vertices,
+            // lattice points) around the selection pivot.
+            let comp_objs: Vec<&String> = objs.iter().filter(|o| o.contains('[')).collect();
+            if !comp_objs.is_empty() {
+                let specs: Vec<String> = comp_objs.iter().map(|s| s.to_string()).collect();
+                run(app, &format!("select {}", specs.join(" ")))?;
+            }
+            if (objs.is_empty() || !comp_objs.is_empty()) && app.comp_mode != CompMode::Object && !app.comp_sel.is_empty() {
+                app.transform_components(cmd, v, rel)?;
+                return Ok(String::new());
+            }
             let ids = targets(app, &objs)?;
             if ids.is_empty() {
                 return Err(format!("{cmd}: nothing selected"));
             }
-            let rel = a.has("r") || a.has("relative") || a.has("by");
             app.checkpoint();
             for id in &ids {
                 if let Some(n) = app.scene.node_mut(*id) {
@@ -439,6 +558,19 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             }
             app.auto_key_touch(&ids);
             Ok(String::new())
+        }
+        "pointPosition" => {
+            let spec = a.positional.first().ok_or("pointPosition node.cv[i] | node.vtx[i]")?;
+            let (id, mode, idx) = parse_component(app, spec).ok_or_else(|| format!("pointPosition: expected a point, got '{spec}'"))??;
+            if mode != CompMode::Vertex {
+                return Err("pointPosition: use .cv[] / .vtx[] / .pt[]".into());
+            }
+            let pts = crate::rig::deformed_positions(&app.scene, id).unwrap_or_else(|| {
+                let w = app.scene.world_matrix(id);
+                app.scene.node(id).and_then(|n| n.points()).map(|p| p.iter().map(|q| w.transform_point3(*q)).collect()).unwrap_or_default()
+            });
+            let p = pts.get(idx[0] as usize).copied().unwrap_or(Vec3::ZERO);
+            Ok(format!("{} {} {}", fmt_num(p.x), fmt_num(p.y), fmt_num(p.z)))
         }
         "setAttr" => {
             let spec = a.positional.first().ok_or("setAttr: missing node.attr")?;
@@ -467,6 +599,9 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                     v => v.parse().ok(),
                 })
                 .collect();
+            if let Some(r) = crate::fx::set_attr(app, spec, &nums) {
+                return r.map(|_| String::new());
+            }
             if let Some(r) = set_look_attr(app, spec, &nums) {
                 return r.map(|_| String::new());
             }
@@ -488,6 +623,9 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
         }
         "getAttr" => {
             let spec = a.positional.first().ok_or("getAttr: missing node.attr")?;
+            if let Some(v) = crate::fx::get_attr(app, spec) {
+                return Ok(v);
+            }
             if let Some((bid, bi)) = blend_attr(app, spec) {
                 return Ok(format!("{}", app.scene.node(bid).and_then(|n| n.blend.as_ref()).map(|b| b.weights[bi]).unwrap_or(0.0)));
             }
@@ -632,6 +770,9 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 s if s.starts_with("rotate") => Tool::Rotate,
                 s if s.starts_with("scale") => Tool::Scale,
                 s if s.starts_with("multicut") || s.starts_with("polysplit") => Tool::MultiCut,
+                s if s.starts_with("cvcurve") || s == "curvecv" => Tool::CurveCv,
+                s if s.starts_with("epcurve") || s == "curveep" => Tool::CurveEp,
+                s if s.starts_with("quaddraw") => Tool::QuadDraw,
                 s if s.starts_with("sculpt") => Tool::Sculpt,
                 _ => return Err(format!("Unknown tool '{t}'")),
             };
@@ -850,14 +991,6 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             let ids = if a.positional.is_empty() { vec![] } else { resolve(app, &a.positional)? };
             app.goto_bind_pose(&ids);
             Ok(String::new())
-        }
-        "circle" => {
-            let name = a.get("n").or(a.get("name")).map(String::from);
-            let id = app.create_control("circle", a.f(&["r", "radius"], 1.0), normal_flag, name.as_deref())?;
-            if let Some(p) = pos_flag {
-                crate::rig::set_world_position(&mut app.scene, id, p);
-            }
-            Ok(app.scene.node(id).unwrap().name.clone())
         }
         "controlShape" => {
             let shape = a.get("s").unwrap_or("circle").to_string();
@@ -1777,6 +1910,13 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
         }
         other => Err(format!("Cannot find procedure \"{other}\".")),
     }
+}
+
+/// Number for MEL output: rounded to 1e-5, without trailing zeros ("1", "0.25", "-3.5").
+pub(crate) fn fmt_num(v: f32) -> String {
+    let r = (v as f64 * 1e5).round() / 1e5;
+    let r = if r == 0.0 { 0.0 } else { r };
+    format!("{r}")
 }
 
 fn names(app: &App, ids: &[NodeId]) -> String {

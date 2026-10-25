@@ -1,4 +1,4 @@
-//! Lattice (FFD) and Wrap deformers.
+//! Lattice (FFD), Wrap and Wire deformers.
 
 use crate::app::{App, CompMode};
 use crate::scene::{NodeId, Scene, Shape};
@@ -89,8 +89,75 @@ pub fn apply_lattices(scene: &Scene, binds: &[LatticeBind], pts: &mut [Vec3]) {
     }
 }
 
+/// A mesh's binding to a wire curve (Maya's wire deformer).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WireBind {
+    pub curve: NodeId,
+    /// World-space CVs of the curve at bind time (the "base wire").
+    pub base_cvs: Vec<Vec3>,
+    /// Per influenced vertex: (vertex, curve parameter, falloff weight).
+    pub binds: Vec<(u32, f32, f32)>,
+    /// Distance from the wire at which the influence reaches zero.
+    pub dropoff: f32,
+    /// Overall strength (0..1).
+    pub envelope: f32,
+    /// How much vertices turn with the curve's tangent (0..1).
+    pub rotation: f32,
+}
+
+/// Smooth falloff: 1 on the wire, 0 at `dropoff`.
+pub fn wire_falloff(d: f32, dropoff: f32) -> f32 {
+    if dropoff <= 0.0 || d >= dropoff {
+        return 0.0;
+    }
+    let x = d / dropoff;
+    (1.0 - x * x) * (1.0 - x * x)
+}
+
+/// Bind world-space points to a world-space wire curve.
+pub fn wire_bind(curve: &crate::nurbs::Curve, pts: &[Vec3], dropoff: f32) -> Vec<(u32, f32, f32)> {
+    let mut out = Vec::new();
+    // Cheap reject: points farther than dropoff from every curve sample.
+    let samples = curve.tessellate(8);
+    let reach = dropoff + samples.windows(2).map(|w| w[0].distance(w[1])).fold(0.0, f32::max);
+    for (v, p) in pts.iter().enumerate() {
+        if samples.iter().all(|s| s.distance(*p) > reach) {
+            continue;
+        }
+        let t = curve.closest_param(*p);
+        let w = wire_falloff(curve.point(t).distance(*p), dropoff);
+        if w > 1e-5 {
+            out.push((v as u32, t, w));
+        }
+    }
+    out
+}
+
+/// Apply wire bindings to world-space points.
+pub fn apply_wires(scene: &Scene, binds: &[WireBind], pts: &mut [Vec3]) {
+    for b in binds {
+        let Some(cur) = crate::nurbs::world_curve(scene, b.curve) else { continue };
+        if cur.cvs.len() != b.base_cvs.len() {
+            continue;
+        }
+        let base = crate::nurbs::Curve { cvs: b.base_cvs.clone(), ..cur.clone() };
+        for &(v, t, w) in &b.binds {
+            let Some(p) = pts.get_mut(v as usize) else { continue };
+            let (bp, cp) = (base.point(t), cur.point(t));
+            let rot = if b.rotation > 0.0 {
+                let (tb, tc) = (base.tangent(t).normalize_or_zero(), cur.tangent(t).normalize_or_zero());
+                if tb == Vec3::ZERO || tc == Vec3::ZERO { glam::Quat::IDENTITY } else { glam::Quat::IDENTITY.slerp(glam::Quat::from_rotation_arc(tb, tc), b.rotation) }
+            } else {
+                glam::Quat::IDENTITY
+            };
+            let target = cp + rot * (*p - bp);
+            *p = p.lerp(target, (w * b.envelope).clamp(0.0, 1.0));
+        }
+    }
+}
+
 /// Closest point on triangle (a, b, c) to p, as barycentric weights.
-fn closest_bary(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> [f32; 3] {
+pub(crate) fn closest_bary(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> [f32; 3] {
     // Ericson, Real-Time Collision Detection 5.1.5.
     let ab = b - a;
     let ac = c - a;
@@ -257,8 +324,87 @@ impl App {
             if let Some(n) = self.scene.node_mut(*id) {
                 n.lattices.clear();
                 n.wrap = None;
+                n.wires.clear();
             }
         }
+    }
+
+    /// Wire deformer: `meshes` follow `curve` within `dropoff` of it. Returns the number of
+    /// vertices bound.
+    pub fn create_wire(&mut self, curve: NodeId, meshes: &[NodeId], dropoff: f32, envelope: f32, rotation: f32) -> Result<usize, String> {
+        let c = crate::nurbs::world_curve(&self.scene, curve).ok_or("Wire: the wire must be a curve (select the meshes, then the curve last).")?;
+        if !c.is_valid() {
+            return Err("Wire: the curve needs at least 2 CVs.".into());
+        }
+        let meshes: Vec<NodeId> = meshes.iter().copied().filter(|m| *m != curve && self.scene.node(*m).is_some_and(|n| n.mesh().is_some())).collect();
+        if meshes.is_empty() {
+            return Err("Wire: select the meshes to deform, then the curve.".into());
+        }
+        let dropoff = if dropoff > 0.0 {
+            dropoff
+        } else {
+            // Default: a fifth of the mesh size, like a sensible Maya dropoffDistance.
+            let (lo, hi) = self.world_bounds(&meshes).unwrap_or((Vec3::ZERO, Vec3::ONE));
+            ((hi - lo).max_element() * 0.2).max(1e-3)
+        };
+        self.checkpoint();
+        let mut total = 0;
+        for m in meshes {
+            let pts = crate::rig::deformed_positions(&self.scene, m).unwrap_or_else(|| {
+                let w = self.scene.world_matrix(m);
+                self.scene.node(m).unwrap().mesh().unwrap().positions.iter().map(|p| w.transform_point3(*p)).collect()
+            });
+            let binds = wire_bind(&c, &pts, dropoff);
+            total += binds.len();
+            if let Some(n) = self.scene.node_mut(m) {
+                n.wires.retain(|w| w.curve != curve);
+                n.wires.push(WireBind { curve, base_cvs: c.cvs.clone(), binds, dropoff, envelope: envelope.clamp(0.0, 1.0), rotation: rotation.clamp(0.0, 1.0) });
+            }
+        }
+        Ok(total)
+    }
+
+    /// Change the envelope / dropoff of wires driven by `curve` (rebinds for a new dropoff).
+    pub fn edit_wire(&mut self, curve: NodeId, dropoff: Option<f32>, envelope: Option<f32>, rotation: Option<f32>) -> Result<usize, String> {
+        let users: Vec<NodeId> = self.scene.nodes.iter().filter(|n| n.wires.iter().any(|w| w.curve == curve)).map(|n| n.id).collect();
+        if users.is_empty() {
+            return Err("No wire deformer uses that curve.".into());
+        }
+        self.checkpoint();
+        for id in &users {
+            let n = self.scene.node_mut(*id).unwrap();
+            for w in n.wires.iter_mut().filter(|w| w.curve == curve) {
+                if let Some(e) = envelope {
+                    w.envelope = e.clamp(0.0, 1.0);
+                }
+                if let Some(r) = rotation {
+                    w.rotation = r.clamp(0.0, 1.0);
+                }
+            }
+        }
+        if let Some(d) = dropoff.filter(|d| *d > 0.0) {
+            for id in &users {
+                let n = self.scene.node(*id).unwrap();
+                let Some(wb) = n.wires.iter().find(|w| w.curve == curve).cloned() else { continue };
+                let Some(cur) = crate::nurbs::world_curve(&self.scene, curve) else { continue };
+                let base = crate::nurbs::Curve { cvs: wb.base_cvs.clone(), ..cur };
+                // Rest positions: evaluate without this wire.
+                let mut tmp = self.scene.clone();
+                if let Some(t) = tmp.node_mut(*id) {
+                    t.wires.retain(|w| w.curve != curve);
+                }
+                let pts = crate::rig::deformed_positions(&tmp, *id).unwrap_or_else(|| {
+                    let w = tmp.world_matrix(*id);
+                    tmp.node(*id).unwrap().mesh().unwrap().positions.iter().map(|p| w.transform_point3(*p)).collect()
+                });
+                let binds = wire_bind(&base, &pts, d);
+                for w in self.scene.node_mut(*id).unwrap().wires.iter_mut().filter(|w| w.curve == curve) {
+                    w.binds = binds.clone();
+                    w.dropoff = d;
+                }
+            }
+        }
+        Ok(users.len())
     }
 }
 

@@ -4,10 +4,176 @@ use super::Action;
 use crate::app::{App, CompMode, MenuSet, Workspace};
 use crate::mesh::Primitive;
 use crate::scene::Channel;
+use glam::Vec3;
 use eframe::egui::{self, Color32, RichText, Sense};
 
 fn item(ui: &mut egui::Ui, label: &str, shortcut: &str) -> bool {
     ui.add(egui::Button::new(label).shortcut_text(shortcut)).clicked()
+}
+
+fn emit(app: &mut App, kind: crate::fx::EmitterKind, from_selection: bool) {
+    let mut st = crate::fx::ParticleSettings { kind, ..Default::default() };
+    if from_selection {
+        st.source = app.lead();
+    }
+    let r = app.create_emitter(st, None, None).map(|id| format!("Created {} (play the timeline to simulate)", app.scene.node(id).map(|n| n.name.as_str()).unwrap_or("")));
+    super::report(app, r);
+}
+
+/// Select colliders, then the particle system / cloth last.
+fn make_collide(app: &mut App, remove: bool) {
+    let sel = app.sel.clone();
+    let r = match sel.split_last() {
+        Some((target, cols)) if !cols.is_empty() => cols.iter().try_for_each(|c| app.connect_collider(*c, *target, remove)).map(|_| if remove { "Colliders removed".to_string() } else { format!("{} collider(s) connected", cols.len()) }),
+        _ => Err("Select the collider meshes, then the particle system or nCloth mesh last.".into()),
+    };
+    super::report(app, r);
+}
+
+fn particles_menu(app: &mut App, ui: &mut egui::Ui) {
+    use crate::fx::EmitterKind as K;
+    if item(ui, "Create Emitter", "omni") {
+        emit(app, K::Omni, false);
+    }
+    if item(ui, "Directional Emitter", "") {
+        emit(app, K::Directional, false);
+    }
+    if item(ui, "Volume Emitter", "scale to size") {
+        emit(app, K::Volume, false);
+    }
+    if item(ui, "Emit from Object", "mesh or curve") {
+        emit(app, K::Omni, true);
+    }
+    ui.separator();
+    if item(ui, "Make Collide", "colliders, then target") {
+        make_collide(app, false);
+    }
+    if item(ui, "Remove Collision", "") {
+        make_collide(app, true);
+    }
+    ui.label(egui::RichText::new("Particles simulate as the time slider plays; settings are in the Attribute Editor.").weak().small());
+}
+
+fn cloth_menu(app: &mut App, ui: &mut egui::Ui) {
+    let sel = app.sel.clone();
+    if item(ui, "Create nCloth", "meshes") {
+        let r = app.create_cloth(&sel, |_| {}).map(|n| format!("{n} mesh(es) are now nCloth (play the timeline)"));
+        super::report(app, r);
+    }
+    if item(ui, "Remove nCloth", "") {
+        let n = app.remove_cloth(&sel);
+        app.info(format!("Removed nCloth from {n} mesh(es)"));
+    }
+    ui.separator();
+    if item(ui, "Pin Selected Vertices", "vertex mode") {
+        let mut msg = Err("Select cloth vertices first (F9).".to_string());
+        for (id, vs) in app.comp_vertices() {
+            msg = app.pin_cloth(id, &vs, None, false).map(|n| format!("{n} pinned vertices"));
+        }
+        super::report(app, msg);
+    }
+    if item(ui, "Clear Pins", "") {
+        let r = sel.iter().try_for_each(|id| app.pin_cloth(*id, &[], None, true).map(|_| ())).map(|_| "Pins cleared".to_string());
+        super::report(app, r);
+    }
+    if item(ui, "Make Collide", "colliders, then cloth") {
+        make_collide(app, false);
+    }
+    ui.label(egui::RichText::new("Pin to a joint or control in the Attribute Editor › nCloth.").weak().small());
+}
+
+fn curves_menu(app: &mut App, ui: &mut egui::Ui) {
+    let sel = app.sel.clone();
+    if item(ui, "Rebuild", "") {
+        let (sp, d) = (app.curve_opts.rebuild_spans as usize, app.curve_opts.rebuild_degree as usize);
+        let r = app.rebuild_curves(&sel, sp, d).map(|n| format!("Rebuilt {n} curve(s)"));
+        super::report(app, r);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Spans");
+        ui.add(egui::DragValue::new(&mut app.curve_opts.rebuild_spans).range(1..=256));
+        ui.label("Degree");
+        ui.radio_value(&mut app.curve_opts.rebuild_degree, 1, "1");
+        ui.radio_value(&mut app.curve_opts.rebuild_degree, 3, "3");
+    });
+    if item(ui, "Reverse Direction", "") {
+        let r = app.reverse_curves(&sel).map(|n| format!("Reversed {n} curve(s)"));
+        super::report(app, r);
+    }
+    if item(ui, "Open/Close", "") {
+        let r = app.open_close_curves(&sel).map(|n| format!("Toggled {n} curve(s)"));
+        super::report(app, r);
+    }
+    ui.separator();
+    if item(ui, "Attach", "two curves") {
+        let r = if sel.len() >= 2 { app.attach_curves(sel[0], sel[1]).map(|_| "Attached".to_string()) } else { Err("Attach: select two curves.".into()) };
+        super::report(app, r);
+    }
+    if item(ui, "Detach", "at the middle") {
+        let r = match sel.first().and_then(|i| crate::nurbs::world_curve(&app.scene, *i).map(|c| (*i, c))) {
+            Some((id, c)) => {
+                let (a, b) = c.domain();
+                app.detach_curve(id, 0.5 * (a + b)).map(|_| "Detached".to_string())
+            }
+            None => Err("Detach: select a curve.".into()),
+        };
+        super::report(app, r);
+    }
+    ui.separator();
+    if item(ui, "Edit CVs", "F9") {
+        app.set_comp_mode(CompMode::Vertex);
+    }
+}
+
+fn surfaces_menu(app: &mut App, ui: &mut egui::Ui) {
+    let sel = app.sel.clone();
+    let o = app.curve_opts.clone();
+    if item(ui, "Revolve", "profile curves") {
+        let axis = [Vec3::X, Vec3::Y, Vec3::Z][o.revolve_axis.min(2)];
+        let r = app.revolve_curves(&sel, axis, Vec3::ZERO, o.revolve_sections, 0.0, 360.0, o.samples, true, None).map(|v| format!("Revolved {} surface(s)", v.len()));
+        super::report(app, r);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Axis");
+        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+            ui.radio_value(&mut app.curve_opts.revolve_axis, i, *n);
+        }
+        ui.label("Sections");
+        ui.add(egui::DragValue::new(&mut app.curve_opts.revolve_sections).range(3..=256));
+    });
+    if item(ui, "Loft", "curves in order") {
+        let r = app.loft_curves(&sel, o.loft_sections, o.loft_close, o.samples, true, None).map(|_| "Lofted".to_string());
+        super::report(app, r);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Section spans");
+        ui.add(egui::DragValue::new(&mut app.curve_opts.loft_sections).range(1..=64));
+        ui.checkbox(&mut app.curve_opts.loft_close, "Close");
+    });
+    if item(ui, "Extrude", "profile [, path]") {
+        let r = match sel.first() {
+            Some(p) => app.extrude_curve(*p, sel.get(1).copied(), o.extrude_length, Vec3::ZERO, o.samples, true, None).map(|_| "Extruded".to_string()),
+            None => Err("Extrude: select a profile curve (then a path curve to sweep along).".into()),
+        };
+        super::report(app, r);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Length (no path)");
+        ui.add(egui::DragValue::new(&mut app.curve_opts.extrude_length).speed(0.05));
+    });
+    if item(ui, "Planar", "closed curve") {
+        let r = match sel.first() {
+            Some(c) => app.planar_curve(*c, o.samples, true, None).map(|_| "Planar surface".to_string()),
+            None => Err("Planar: select a closed curve.".into()),
+        };
+        super::report(app, r);
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Samples per curve");
+        ui.add(egui::DragValue::new(&mut app.curve_opts.samples).range(3..=512));
+    });
+    ui.label(egui::RichText::new("Surfaces are polygon meshes with history: editing the curves updates them.").weak().small());
 }
 
 fn planned(ui: &mut egui::Ui, label: &str) {
@@ -134,8 +300,31 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             ui.menu_button("Lights", |ui| super::lookdev::lights_menu(app, ui));
             ui.menu_button("Cameras", |ui| super::lookdev::cameras_menu(app, ui));
             ui.menu_button("Curve Tools", |ui| {
-                planned(ui, "CV Curve Tool");
-                planned(ui, "EP Curve Tool");
+                if item(ui, "CV Curve Tool", "click, Enter") {
+                    app.curve_tool.points.clear();
+                    app.tool = crate::app::Tool::CurveCv;
+                }
+                if item(ui, "EP Curve Tool", "click, Enter") {
+                    app.curve_tool.points.clear();
+                    app.tool = crate::app::Tool::CurveEp;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Degree");
+                    ui.radio_value(&mut app.curve_tool.degree, 1, "1 Linear");
+                    ui.radio_value(&mut app.curve_tool.degree, 3, "3 Cubic");
+                });
+            });
+            ui.menu_button("NURBS Primitives", |ui| {
+                if item(ui, "Circle", "") {
+                    let (r, s) = (app.curve_opts.circle_radius, app.curve_opts.circle_sections as usize);
+                    app.create_circle(r, s, Vec3::Y, Vec3::ZERO, None);
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Radius");
+                    ui.add(egui::DragValue::new(&mut app.curve_opts.circle_radius).speed(0.05).range(0.001..=1000.0));
+                    ui.label("Sections");
+                    ui.add(egui::DragValue::new(&mut app.curve_opts.circle_sections).range(3..=64));
+                });
             });
             planned(ui, "Type");
         });
@@ -182,6 +371,15 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             }
             planned(ui, "Center Pivot");
             planned(ui, "Snap Align Objects");
+            ui.separator();
+            if item(ui, "Make Live", "mesh") {
+                let id = app.lead();
+                let r = app.qd_make_live(id).map(|_| String::new());
+                super::report(app, r);
+            }
+            if item(ui, "Make Not Live", "") {
+                let _ = app.qd_make_live(None);
+            }
         });
         ui.menu_button("Display", |ui| {
             if item(ui, "Hide Selection", "Ctrl+H") {
@@ -229,7 +427,9 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             MenuSet::Animation => animation_menus(app, ui),
             MenuSet::Rigging => super::rigging::rigging_menus(app, ui),
             MenuSet::Fx => {
-                for m in ["nParticles", "Fluids", "nCloth", "nHair", "Fields/Solvers", "Effects", "Bifrost Fluids"] {
+                ui.menu_button("nParticles", |ui| particles_menu(app, ui));
+                ui.menu_button("nCloth", |ui| cloth_menu(app, ui));
+                for m in ["Fluids", "nHair", "Fields/Solvers", "Effects", "Bifrost Fluids"] {
                     ui.menu_button(m, |ui| planned(ui, "Not available in this build"));
                 }
             }
@@ -344,7 +544,16 @@ fn modeling_menus(app: &mut App, ui: &mut egui::Ui) {
             app.tool = crate::app::Tool::Sculpt;
         }
         ui.checkbox(&mut app.soft_select, "Soft Select (B)");
-        planned(ui, "Quad Draw");
+        if item(ui, "Quad Draw", "on a live mesh") {
+            // The selected mesh becomes live (unless one already is).
+            if app.qd.live.is_none()
+                && let Some(id) = app.lead().filter(|i| app.scene.node(*i).is_some_and(|n| n.mesh().is_some()))
+            {
+                let _ = app.qd_make_live(Some(id));
+            }
+            app.qd.target = None;
+            app.tool = crate::app::Tool::QuadDraw;
+        }
     });
     ui.menu_button("Mesh Display", |ui| {
         if ui.button("Reverse (normals)").clicked() {
@@ -353,8 +562,8 @@ fn modeling_menus(app: &mut App, ui: &mut egui::Ui) {
         planned(ui, "Soften Edge");
         planned(ui, "Harden Edge");
     });
-    ui.menu_button("Curves", |ui| planned(ui, "Not available"));
-    ui.menu_button("Surfaces", |ui| planned(ui, "Not available"));
+    ui.menu_button("Curves", |ui| curves_menu(app, ui));
+    ui.menu_button("Surfaces", |ui| surfaces_menu(app, ui));
     super::rigging::deform_menu(app, ui);
     ui.menu_button("UV", |ui| uv_menu(app, ui));
     ui.menu_button("Generate", |ui| planned(ui, "Not available"));
@@ -1028,12 +1237,69 @@ pub fn shelf(app: &mut App, ui: &mut egui::Ui) {
                 let acc = Color32::from_rgb(230, 170, 70);
                 super::lookdev::rendering_shelf(app, ui, &mut |ui, l, t, e| shelf_button(ui, l, acc, t, e));
             }
-            i => {
-                let names: &[&str] = match i {
-                    0 => &["CV", "EP", "Bezier", "Circle", "NSphere", "NCube", "Loft", "Revolve"],
-                    6 => &["nPart", "Emit", "nCloth", "Fluid", "Field"],
-                    _ => &["Network", "Distrib", "Repro"],
-                };
+            0 => {
+                let acc = Color32::from_rgb(110, 200, 120);
+                if shelf_button(ui, "CV", acc, "CV Curve Tool", true) {
+                    app.curve_tool.points.clear();
+                    app.tool = crate::app::Tool::CurveCv;
+                }
+                if shelf_button(ui, "EP", acc, "EP Curve Tool", true) {
+                    app.curve_tool.points.clear();
+                    app.tool = crate::app::Tool::CurveEp;
+                }
+                if shelf_button(ui, "Circle", acc, "NURBS circle", true) {
+                    let (r, s) = (app.curve_opts.circle_radius, app.curve_opts.circle_sections as usize);
+                    app.create_circle(r, s, Vec3::Y, Vec3::ZERO, None);
+                }
+                let sel = app.sel.clone();
+                let o = app.curve_opts.clone();
+                if shelf_button(ui, "Revolve", acc, "Revolve the selected curves around Y", !sel.is_empty()) {
+                    let r = app.revolve_curves(&sel, Vec3::Y, Vec3::ZERO, o.revolve_sections, 0.0, 360.0, o.samples, true, None).map(|_| String::new());
+                    super::report(app, r);
+                }
+                if shelf_button(ui, "Loft", acc, "Loft through the selected curves", sel.len() >= 2) {
+                    let r = app.loft_curves(&sel, o.loft_sections, o.loft_close, o.samples, true, None).map(|_| String::new());
+                    super::report(app, r);
+                }
+                if shelf_button(ui, "Extrude", acc, "Extrude profile (along a path if two curves are selected)", !sel.is_empty()) {
+                    let r = app.extrude_curve(sel[0], sel.get(1).copied(), o.extrude_length, Vec3::ZERO, o.samples, true, None).map(|_| String::new());
+                    super::report(app, r);
+                }
+                if shelf_button(ui, "Planar", acc, "Fill a closed curve", !sel.is_empty()) {
+                    let r = app.planar_curve(sel[0], o.samples, true, None).map(|_| String::new());
+                    super::report(app, r);
+                }
+            }
+            6 => {
+                use crate::fx::EmitterKind as K;
+                let acc = Color32::from_rgb(240, 150, 70);
+                if shelf_button(ui, "Emit", acc, "Omni particle emitter", true) {
+                    emit(app, K::Omni, false);
+                }
+                if shelf_button(ui, "EmitObj", acc, "Emit from the selected mesh or curve", app.lead().is_some()) {
+                    emit(app, K::Omni, true);
+                }
+                if shelf_button(ui, "nCloth", acc, "Make the selected meshes cloth", !app.sel.is_empty()) {
+                    let sel = app.sel.clone();
+                    let r = app.create_cloth(&sel, |_| {}).map(|_| String::new());
+                    super::report(app, r);
+                }
+                if shelf_button(ui, "Pin", acc, "Pin the selected cloth vertices", app.comp_mode != CompMode::Object) {
+                    let mut r = Ok(String::new());
+                    for (id, vs) in app.comp_vertices() {
+                        r = app.pin_cloth(id, &vs, None, false).map(|n| format!("{n} pinned"));
+                    }
+                    super::report(app, r);
+                }
+                if shelf_button(ui, "Collide", acc, "Colliders, then the particles / cloth", app.sel.len() >= 2) {
+                    make_collide(app, false);
+                }
+                for n in ["Fluid", "Field"] {
+                    shelf_button(ui, n, Color32::from_rgb(150, 150, 150), n, false);
+                }
+            }
+            _ => {
+                let names: &[&str] = &["Network", "Distrib", "Repro"];
                 for n in names {
                     shelf_button(ui, n, Color32::from_rgb(150, 150, 150), n, false);
                 }

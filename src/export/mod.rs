@@ -86,6 +86,8 @@ pub struct Baked {
     pub weights: HashMap<NodeId, Vec<Vec<f32>>>,
     /// Object-space deformed points per frame (meshes with deformers only).
     pub points: HashMap<NodeId, Vec<Vec<Vec3>>>,
+    /// Object-space particle positions per frame (particle systems).
+    pub particles: HashMap<NodeId, Vec<Vec<Vec3>>>,
 }
 
 impl Baked {
@@ -98,7 +100,7 @@ impl Baked {
                 f += 1.0;
             }
         }
-        let mut b = Baked { frames, trs: HashMap::new(), weights: HashMap::new(), points: HashMap::new() };
+        let mut b = Baked { frames, trs: HashMap::new(), weights: HashMap::new(), points: HashMap::new(), particles: HashMap::new() };
         if b.frames.len() < 2 {
             b.frames.clear();
             return b;
@@ -113,6 +115,10 @@ impl Baked {
                 let n = sc.node(id).unwrap();
                 if let Some(bs) = &n.blend {
                     b.weights.entry(id).or_default().push(bs.weights.clone());
+                }
+                if let crate::scene::Shape::Particles(ps) = &n.shape {
+                    let inv = sc.world_matrix(id).inverse();
+                    b.particles.entry(id).or_default().push(ps.current().iter().map(|q| inv.transform_point3(q.p)).collect());
                 }
                 if with_points && crate::rig::has_deformers(&sc, id) {
                     let world = crate::rig::deformed_positions(&sc, id).unwrap_or_default();

@@ -76,7 +76,23 @@ ANIMATION TOOLS: keyTangent -t 12 -ott spline|linear|flat|step|auto obj   copyKe
 MODELING TOOLS: polySplit -ep edgeIdx 0.5 -ep edgeIdx 0.5 obj (multi-cut)   softSelect -sse on -ssd 1.5
   sculpt -b sculpt|smooth|grab|flatten|inflate|pinch -s 0.5 -r 60 -sym on (sets the brush; the user strokes)
   lattice -dv 2 5 2 -n ffd obj; latticePoint ffd i j k x y z (local -0.5..0.5; e.g. flare the top: latticePoint ffd 0 4 0 -0.8 0.5 -0.8)
-  wrap -d cageMesh hiResMesh (cage deforms the mesh)   lattice -rm obj (remove lattice/wrap)
+  wrap -d cageMesh hiResMesh (cage deforms the mesh)   lattice -rm obj (remove lattice/wrap/wire)
+CURVES (NURBS, degree 3 by default): curve -d 3 -p x y z -p x y z ... [-per] -n name (CVs)   curve -ep x y z -ep ... -n name (passes through points)
+  circle -r 1 -s 8 -nr 0 1 0 -c x y z -n name   rebuildCurve -s 8 -d 3 crv   reverseCurve crv   closeCurve crv (open/close)
+  attachCurve a b   detachCurve crv.u[1.5] | detachCurve -pf 0.5 crv   select crv.cv[2:4]; move -r 0 1 0   pointPosition crv.cv[0]
+  components on any object: select obj.vtx[0:3] | obj.e[5] | obj.f[*] | crv.cv[*], then move/rotate/scale (no names) moves them
+SURFACES (polygon output with live history — editing the curves updates the mesh):
+  revolve -ax 0 1 0 -p 0 0 0 -s 16 [-ssw 0 -esw 360] -n vase profileCurve (profile in the XY plane, x = radius)
+  loft -ss 2 [-c] -n hull c1 c2 c3 (through curves in order)   extrude -n pipe profile pathCurve | extrude -l 2 -dir 0 1 0 profile
+  planarSrf -n cap closedCurve   (e.g. vase: curve -d 3 -p 0.3 0 0 -p 0.9 0.6 0 -p 0.5 1.6 0 -p 0.7 2.2 0 -n prof; revolve -s 24 -n vase prof)
+WIRE DEFORMER: wire -w curve -dds 0 1.5 meshes (vertices within 1.5 follow the curve)   wire -e -w curve -en 0.5 | -dds 0 2 | -rot 1
+QUAD DRAW (retopology): makeLive refMesh; quadDraw -dot x y z (snaps onto the live mesh, returns the dot index)
+  quadDraw -quad i j k l | -tri i j k | -extend a b dx dy dz | -relax 5 | -deleteFace f | -deleteDot i | -new | -finish   (quadDraw alone opens the tool)
+FX (simulations play with the timeline; set playbackOptions first; currentTime N shows frame N):
+  emitter -type omni|dir|surface|curve|volume -r 200 -spd 3 -sp 20 -dir 0 1 0 -lifespan 2 -rad 0.03 -rgb 1 0.6 0.2 -n sparks [sourceMesh]
+  setAttr sparks.turbulence 2; setAttr sparks.wind 3 0 0; setAttr sparks.gravity 0 -9.81 0; setAttr sparks.bounce 0.5   (volume emitter: scale it)
+  nCloth -stretch 1 -bend 0.1 cape (a subdivided polyPlane works well: polyPlane -w 2 -h 2 -sx 20 -sy 20)
+  clothPin -to chest_jnt cape.vtx[0:20] (pins follow a joint/control)   setAttr flag.wind 5 0 0   connectDynamic -c body cape (collider)
 RECIPES (tuned one-liners — PREFER these for lighting, materials and character animation; each is one undo step):
   lightRig -preset studio|outdoor|sunset|night|product|dramatic [-i 1.0] [-target objects]
       builds a named light rig (key_light, fill_light, rim_light, sun_light, ...) aimed at the subject, grouped as lightRig

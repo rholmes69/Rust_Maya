@@ -206,11 +206,24 @@ pub fn deform_menu(app: &mut App, ui: &mut egui::Ui) {
             };
             report(app, r);
         }
-        if item(ui, "Remove Lattice / Wrap", "") {
+        if item(ui, "Remove Lattice / Wrap / Wire", "") {
             let sel = app.sel.clone();
             app.remove_lattice_and_wrap(&sel);
         }
-        ui.add_enabled(false, egui::Button::new("Wire")).on_disabled_hover_text("Planned");
+        ui.separator();
+        if item(ui, "Wire", "meshes, then curve") {
+            let mut sel = app.sel.clone();
+            let curve = sel.iter().rposition(|i| app.scene.node(*i).is_some_and(|n| matches!(n.shape, crate::scene::Shape::Curve { .. }))).map(|i| sel.remove(i));
+            let r = match curve {
+                Some(c) => app.create_wire(c, &sel, app.curve_opts.wire_dropoff, 1.0, 1.0).map(|n| format!("Wire: {n} vertices bound")),
+                None => Err("Wire: select the meshes to deform, then the curve.".into()),
+            };
+            report(app, r);
+        }
+        ui.horizontal(|ui| {
+            ui.label("Dropoff (0 = auto)");
+            ui.add(egui::DragValue::new(&mut app.curve_opts.wire_dropoff).speed(0.02).range(0.0..=1000.0));
+        });
     });
 }
 

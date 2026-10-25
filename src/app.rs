@@ -40,6 +40,12 @@ pub enum Tool {
     MultiCut,
     /// Sculpting brushes.
     Sculpt,
+    /// Mesh Tools › Quad Draw (retopology on a live surface).
+    QuadDraw,
+    /// Create › Curve Tools › CV Curve Tool.
+    CurveCv,
+    /// Create › Curve Tools › EP Curve Tool.
+    CurveEp,
 }
 
 impl Tool {
@@ -57,6 +63,9 @@ impl Tool {
             Tool::EdgeLoop => "Insert Edge Loop Tool",
             Tool::MultiCut => "Multi-Cut Tool",
             Tool::Sculpt => "Sculpt Tool",
+            Tool::QuadDraw => "Quad Draw Tool",
+            Tool::CurveCv => "CV Curve Tool",
+            Tool::CurveEp => "EP Curve Tool",
         }
     }
 }
@@ -295,6 +304,11 @@ pub struct App {
     pub lattice_div: [u32; 3],
     /// Multi-Cut points (mesh, edge, t).
     pub cut_points: Vec<(NodeId, (u32, u32), f32)>,
+    /// Quad Draw tool state.
+    pub qd: crate::quad_draw::QuadDraw,
+    /// CV / EP Curve tool: points placed so far.
+    pub curve_tool: crate::curve_ops::CurveTool,
+    pub curve_opts: crate::curve_ops::CurveOpts,
     pub(crate) anim_overlay_cache: Option<(u64, Vec<GpuVertex>, Vec<GpuVertex>)>,
     /// Selected UVs (mesh, uv index) for the UV Editor.
     pub uv_sel: BTreeSet<(NodeId, u32)>,
@@ -419,6 +433,9 @@ impl App {
             soft_radius: 1.0,
             lattice_div: [2, 5, 2],
             cut_points: Vec::new(),
+            qd: crate::quad_draw::QuadDraw { offset: 0.002, relax_iters: 5, ..Default::default() },
+            curve_tool: crate::curve_ops::CurveTool { degree: 3, ..Default::default() },
+            curve_opts: Default::default(),
             uv_sel: BTreeSet::new(),
             textures: Default::default(),
             tex_layers: vec![crate::texture::CHECKER.to_string()],
@@ -611,7 +628,7 @@ impl App {
             .sel
             .iter()
             .copied()
-            .filter(|id| self.scene.node(*id).is_some_and(|n| n.mesh().is_some() || (self.comp_mode == CompMode::Vertex && matches!(n.shape, Shape::Lattice { .. }))))
+            .filter(|id| self.scene.node(*id).is_some_and(|n| n.mesh().is_some() || (self.comp_mode == CompMode::Vertex && matches!(n.shape, Shape::Lattice { .. } | Shape::Curve { .. }))))
             .collect();
         picked
     }
@@ -621,7 +638,7 @@ impl App {
             self.comp_sel.clear();
             self.comp_mode = m;
             if m != CompMode::Object && self.comp_targets().is_empty() {
-                self.warn("Select a polygon object first to edit its components.");
+                self.warn("Select a polygon object (or a curve / lattice for points) first to edit its components.");
             }
             self.info(match m {
                 CompMode::Object => "Object mode",
@@ -1424,8 +1441,15 @@ impl App {
             h.write_u32(c.to_bits());
         }
         (self.sel.contains(&id), lead == Some(id), comp_targets.contains(&id)).hash(&mut h);
+        if let Some(c) = &n.cloth {
+            (c.cache.version, c.cache.current).hash(&mut h);
+        }
         match &n.shape {
             Shape::Poly { .. } => n.mesh_rev().hash(&mut h),
+            Shape::Particles(ps) => {
+                (ps.cache.version, ps.cache.current, ps.cache.key).hash(&mut h);
+                format!("{:?}", ps.settings).hash(&mut h);
+            }
             other => format!("{other:?}").hash(&mut h),
         }
         if let Some(m) = n.material.and_then(|m| self.material(m)) {
@@ -1454,6 +1478,15 @@ impl App {
         for c in &n.clusters {
             hash_mat4(&mut h, &self.scene.world_matrix(c.handle));
             c.weights.len().hash(&mut h);
+        }
+        for wb in &n.wires {
+            hash_mat4(&mut h, &self.scene.world_matrix(wb.curve));
+            (wb.binds.len(), wb.envelope.to_bits(), wb.rotation.to_bits()).hash(&mut h);
+            if let Some(Shape::Curve { points, .. }) = self.scene.node(wb.curve).map(|x| &x.shape) {
+                for p in points {
+                    (p.x.to_bits(), p.y.to_bits(), p.z.to_bits()).hash(&mut h);
+                }
+            }
         }
         for b in &n.lattices {
             hash_mat4(&mut h, &self.scene.world_matrix(b.lattice));
@@ -1564,6 +1597,26 @@ impl App {
                 }
                 continue;
             }
+            if let Shape::Particles(ps) = &node.shape {
+                // Emitter icon (a small star) + particles as shaded octahedra.
+                let c = if selected { wire_col } else { [1.0, 0.65, 0.3] };
+                let o = w.transform_point3(Vec3::ZERO);
+                for d in [Vec3::X, Vec3::Y, Vec3::Z, Vec3::new(1.0, 1.0, 0.0).normalize(), Vec3::new(1.0, -1.0, 0.0).normalize(), Vec3::new(0.0, 1.0, 1.0).normalize(), Vec3::new(0.0, 1.0, -1.0).normalize()] {
+                    extra_wire.push(GpuVertex::line(o - d * 0.25, c));
+                    extra_wire.push(GpuVertex::line(o + d * 0.25, c));
+                }
+                let tris = crate::fx::particle_tris(ps);
+                if !tris.is_empty() {
+                    let lo = tris.iter().fold(Vec3::splat(f32::MAX), |a, t| a.min(t.0));
+                    let hi = tris.iter().fold(Vec3::splat(f32::MIN), |a, t| a.max(t.0));
+                    let verts: Vec<GpuVertex> = tris
+                        .iter()
+                        .map(|(p, n, col)| GpuVertex { pos: p.to_array(), nrm: n.to_array(), col: [col[0], col[1], col[2], 1.0], mat: GpuVertex::DEFAULT_MAT, emi: [0.0; 4], uv: [0.0; 2], maps: [0.0; 4] })
+                        .collect();
+                    g.tris.push(Chunk::with_bounds(verts, Some((lo, hi))));
+                }
+                continue;
+            }
             if let Shape::Lattice { div, points } = &node.shape {
                 let c = if selected { wire_col } else { [0.7, 0.5, 0.95] };
                 for (a, b) in crate::deform::lattice_lines(*div, points) {
@@ -1659,9 +1712,10 @@ impl App {
                     }
                     continue;
                 }
-                Shape::Curve { points, closed } => {
+                Shape::Curve { closed, .. } => {
                     let c = rig_col(color);
-                    let pts: Vec<Vec3> = points.iter().map(|p| w.transform_point3(*p)).collect();
+                    let cv = crate::nurbs::Curve::from_shape(&node.shape).unwrap();
+                    let pts: Vec<Vec3> = cv.tessellate(12).iter().map(|p| w.transform_point3(*p)).collect();
                     let n = pts.len();
                     let segs = if *closed { n } else { n.saturating_sub(1) };
                     for i in 0..segs {

@@ -1233,7 +1233,7 @@ impl Report {
 }
 
 fn is_geom(ty: &str) -> bool {
-    matches!(ty, "Mesh" | "Cube" | "Sphere" | "Cylinder" | "Cone" | "Capsule" | "Plane" | "BasisCurves" | "DistantLight" | "SphereLight" | "RectLight" | "DomeLight" | "DiskLight" | "CylinderLight" | "Camera")
+    matches!(ty, "Mesh" | "Cube" | "Sphere" | "Cylinder" | "Cone" | "Capsule" | "Plane" | "BasisCurves" | "NurbsCurves" | "DistantLight" | "SphereLight" | "RectLight" | "DomeLight" | "DiskLight" | "CylinderLight" | "Camera")
 }
 
 fn has_xform_ops(p: &Prim) -> bool {
@@ -1498,7 +1498,22 @@ impl Builder<'_> {
                     self.rep.notes.push(format!("{}: only the first of {} curves imported", p.name, counts.len()));
                 }
                 if let Some(nd) = self.app.scene.node_mut(id) {
-                    nd.shape = Shape::Curve { points: pts[..n].to_vec(), closed };
+                    nd.shape = Shape::Curve { points: pts[..n].to_vec(), closed, degree: 1, knots: Vec::new() };
+                }
+                self.rep.curves += 1;
+            }
+            "NurbsCurves" => {
+                let pts = p.val("points").map(|v| v.vec3s()).unwrap_or_default();
+                let counts = p.val("curveVertexCounts").map(|v| v.ints()).unwrap_or_default();
+                let n = counts.first().map(|c| *c as usize).unwrap_or(pts.len()).min(pts.len());
+                let order = p.val("order").map(|v| v.ints()).and_then(|o| o.first().copied()).unwrap_or(4).max(2) as usize;
+                let knots: Vec<f32> = p.val("knots").map(|v| v.nums()).unwrap_or_default().iter().map(|k| *k as f32).take(n + order).collect();
+                if counts.len() > 1 {
+                    self.rep.notes.push(format!("{}: only the first of {} curves imported", p.name, counts.len()));
+                }
+                let c = crate::nurbs::from_usd(&pts[..n], order, &knots);
+                if let Some(nd) = self.app.scene.node_mut(id) {
+                    nd.shape = c.into_shape();
                 }
                 self.rep.curves += 1;
             }

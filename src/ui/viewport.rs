@@ -300,6 +300,7 @@ fn show_view(app: &mut App, ui: &mut egui::Ui, vid: usize, rect: Rect, geom: Arc
             painter.circle_filled(*p, 4.0, Color32::from_rgb(255, 200, 240));
         }
     }
+    draw_tool_overlays(app, &painter, &pr, ui);
     draw_gizmo(app, &painter, vid, vp, &pr);
     if resp.hovered() {
         if let Some(mp) = ui.input(|i| i.pointer.hover_pos()) {
@@ -603,6 +604,75 @@ fn handle_input(app: &mut App, ui: &egui::Ui, vid: usize, vp: Rect, resp: &egui:
         }
     }
 
+    // CV / EP Curve tools: each click adds a point (on the live surface, else the grid).
+    if matches!(app.tool, Tool::CurveCv | Tool::CurveEp) && app.interact.drag.is_none() && resp.hovered() && pressed[0] && !mods.alt {
+        let mut p = construction_point(app, vid, pr, m);
+        if x_held || app.snap_grid {
+            p = p.round();
+        }
+        app.curve_tool.points.push(p);
+        return;
+    }
+    // Quad Draw.
+    if app.tool == Tool::QuadDraw && !mods.alt && app.interact.drag.is_none() {
+        let down = ui.input(|i| i.pointer.primary_down());
+        if let Some(v) = app.qd.drag {
+            if !down || released[0] {
+                app.qd.drag = None;
+            } else if let Some(p) = qd_surface_point(app, vid, pr, m) {
+                app.qd_move_dot(v, p);
+            }
+            return;
+        }
+        if let Some((a, b, start)) = app.qd.extend {
+            if !down || released[0] {
+                app.qd.extend = None;
+                if let Some(p) = qd_surface_point(app, vid, pr, m)
+                    && p.distance(start) > 1e-4
+                {
+                    let r = app.qd_extend(a, b, p - start).map(|_| "Quad Draw: extended".to_string());
+                    super::report(app, r);
+                }
+            }
+            return;
+        }
+        if pressed[0] && resp.hovered() {
+            let pts = app.qd_points();
+            let near_dot = pts.iter().enumerate().filter_map(|(i, p)| pr.project(*p).map(|s| (s.distance(m), i as u32))).filter(|x| x.0 < 9.0).min_by(|a, b| a.0.total_cmp(&b.0)).map(|x| x.1);
+            if mods.shift {
+                let k = if mods.ctrl { 3 } else { 4 };
+                let near = app.qd_nearest_dots(m, k, &|p| pr.project(p));
+                let fwd = app.views[vid].cam.forward();
+                let r = app.qd_fill(&near, Some(fwd)).map(|_| if k == 4 { "Quad Draw: quad".to_string() } else { "Quad Draw: triangle".to_string() });
+                super::report(app, r);
+            } else if mods.ctrl {
+                if let Some(v) = near_dot {
+                    let r = app.qd_delete_dot(v).map(|_| "Quad Draw: dot deleted".to_string());
+                    super::report(app, r);
+                } else if let Some((a, b)) = qd_border_edge(app, pr, m) {
+                    if let Some(p) = qd_surface_point(app, vid, pr, m) {
+                        app.qd.extend = Some((a, b, p));
+                    }
+                } else if let Some(f) = qd_face_under(app, pr, m) {
+                    let r = app.qd_delete_face(f).map(|_| "Quad Draw: face deleted".to_string());
+                    super::report(app, r);
+                }
+            } else if let Some(v) = near_dot {
+                app.checkpoint();
+                app.qd.drag = Some(v);
+            } else if let Some(p) = qd_surface_point(app, vid, pr, m) {
+                app.qd_add_dot(p);
+            }
+            return;
+        }
+        if pressed[2] && resp.hovered() {
+            app.qd_finish();
+            app.tool = Tool::Select;
+            app.info("Quad Draw finished");
+            return;
+        }
+    }
+
     // Joint tool: each click places a joint (child of the previous one).
     if app.tool == Tool::Joint && app.interact.drag.is_none() && resp.hovered() && pressed[0] && !mods.alt {
         let mut p = joint_plane_point(app, vid, pr, m);
@@ -815,7 +885,7 @@ fn apply_gizmo(app: &mut App, d: &mut Drag, tool: Tool, handle: Handle, vid: usi
     let fine_mul = if fine { 0.2 } else { 1.0 };
     // World-space transform function applied to points (component mode) and data for objects.
     match tool {
-        Tool::Move | Tool::Select | Tool::Joint | Tool::PaintWeights | Tool::EdgeLoop | Tool::MultiCut | Tool::Sculpt => {
+        Tool::Move | Tool::Select | Tool::Joint | Tool::PaintWeights | Tool::EdgeLoop | Tool::MultiCut | Tool::Sculpt | Tool::QuadDraw | Tool::CurveCv | Tool::CurveEp => {
             let delta = match handle {
                 Handle::Axis(i) => {
                     let mut amount = drag.dot(d.screen_dir) / d.px_len * d.gizmo_len * fine_mul;
@@ -948,6 +1018,138 @@ fn joint_plane_point(app: &App, vid: usize, pr: &Projector, m: Vec2) -> Vec3 {
     }
     let t = (origin - ro).dot(normal) / denom;
     ro + rd * t.max(0.0)
+}
+
+/// Where a click lands for the curve tools: the live surface if one is set, else the ground
+/// grid (perspective) or the view plane through the origin (orthographic views).
+fn construction_point(app: &App, vid: usize, pr: &Projector, m: Vec2) -> Vec3 {
+    if let Some(live) = app.qd.live
+        && let Some((_, p, n)) = sculpt_hit(app, pr, m, Some(live))
+    {
+        return p + n * app.qd.offset * 2.0;
+    }
+    let cam = &app.views[vid].cam;
+    let (ro, rd) = pr.ray(m);
+    let normal = if cam.kind == CamKind::Persp { Vec3::Y } else { cam.back_dir() };
+    let den = rd.dot(normal);
+    if den.abs() < 1e-6 {
+        return Vec3::ZERO;
+    }
+    ro + rd * (-ro.dot(normal) / den).max(0.0)
+}
+
+/// Quad Draw surface point under the mouse: live object, else any other visible mesh, else
+/// the construction plane.
+fn qd_surface_point(app: &App, vid: usize, pr: &Projector, m: Vec2) -> Option<Vec3> {
+    if let Some(live) = app.qd.live {
+        return sculpt_hit(app, pr, m, Some(live)).map(|h| h.1);
+    }
+    let (ro, rd) = pr.ray(m);
+    let mut best: Option<(f32, Vec3)> = None;
+    for n in &app.scene.nodes {
+        if Some(n.id) == app.qd.target || !app.scene.is_visible(n.id) {
+            continue;
+        }
+        if let Some((_, p, _)) = sculpt_hit(app, pr, m, Some(n.id)) {
+            let d = p.distance(ro);
+            if best.is_none_or(|b| d < b.0) {
+                best = Some((d, p));
+            }
+        }
+    }
+    let _ = rd;
+    Some(best.map(|b| b.1).unwrap_or_else(|| construction_point(app, vid, pr, m)))
+}
+
+/// Border edge of the Quad Draw mesh under the mouse (within 8 px).
+fn qd_border_edge(app: &App, pr: &Projector, m: Vec2) -> Option<(u32, u32)> {
+    let mesh = app.qd.target.and_then(|t| app.scene.node(t)).and_then(|n| n.mesh())?;
+    let pts = app.qd_points();
+    crate::quad_draw::boundary_edges(mesh)
+        .into_iter()
+        .filter_map(|(a, b)| Some((seg_dist(m, pr.project(pts[a as usize])?, pr.project(pts[b as usize])?), (a, b))))
+        .filter(|x| x.0 < 8.0)
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+        .map(|x| x.1)
+}
+
+fn qd_face_under(app: &App, pr: &Projector, m: Vec2) -> Option<usize> {
+    let t = app.qd.target?;
+    let mesh = app.scene.node(t)?.mesh()?;
+    let inv = app.scene.world_matrix(t).inverse();
+    let (ro, rd) = pr.ray(m);
+    mesh.raycast(inv.transform_point3(ro), inv.transform_vector3(rd)).map(|h| h.1)
+}
+
+/// Quad Draw and curve-tool overlays.
+fn draw_tool_overlays(app: &App, painter: &egui::Painter, pr: &Projector, ui: &egui::Ui) {
+    let hover = ui.input(|i| i.pointer.hover_pos()).map(to_v2);
+    let mods = ui.input(|i| i.modifiers);
+    if matches!(app.tool, Tool::CurveCv | Tool::CurveEp) && !app.curve_tool.points.is_empty() {
+        let col = Color32::from_rgb(255, 210, 90);
+        if let Some(c) = app.curve_tool_preview() {
+            let pts: Vec<Pos2> = c.tessellate(16).iter().filter_map(|p| pr.project(*p).map(to_pos)).collect();
+            for w in pts.windows(2) {
+                painter.line_segment([w[0], w[1]], Stroke::new(1.5, col));
+            }
+        }
+        let cps: Vec<Pos2> = app.curve_tool.points.iter().filter_map(|p| pr.project(*p).map(to_pos)).collect();
+        if app.tool == Tool::CurveCv {
+            for w in cps.windows(2) {
+                painter.line_segment([w[0], w[1]], Stroke::new(1.0, Color32::from_rgb(140, 120, 70)));
+            }
+        }
+        for p in &cps {
+            painter.rect_filled(Rect::from_center_size(*p, egui::vec2(6.0, 6.0)), 0.0, Color32::from_rgb(190, 40, 190));
+        }
+    }
+    if app.tool != Tool::QuadDraw {
+        return;
+    }
+    let pts = app.qd_points();
+    let proj: Vec<Option<Pos2>> = pts.iter().map(|p| pr.project(*p).map(to_pos)).collect();
+    if let Some(mesh) = app.qd.target.and_then(|t| app.scene.node(t)).and_then(|n| n.mesh()) {
+        // Faces drawn on top of the live surface (flat quads dip below a curved surface).
+        for f in &mesh.faces {
+            let poly: Option<Vec<Pos2>> = f.iter().map(|v| proj[*v as usize]).collect();
+            if let Some(poly) = poly.filter(|p| p.len() >= 3) {
+                painter.add(egui::Shape::convex_polygon(poly, Color32::from_rgba_unmultiplied(90, 170, 255, 70), Stroke::NONE));
+            }
+        }
+        for f in &mesh.faces {
+            for i in 0..f.len() {
+                if let (Some(a), Some(b)) = (proj[f[i] as usize], proj[f[(i + 1) % f.len()] as usize]) {
+                    painter.line_segment([a, b], Stroke::new(1.5, Color32::from_rgb(90, 200, 255)));
+                }
+            }
+        }
+    }
+    for p in proj.iter().flatten() {
+        painter.circle_filled(*p, 4.0, Color32::from_rgb(110, 255, 140));
+    }
+    let Some(h) = hover else { return };
+    if mods.shift && pts.len() >= 3 {
+        let k = if mods.ctrl { 3 } else { 4 };
+        let near = app.qd_nearest_dots(h, k, &|p| pr.project(p));
+        if near.len() == k {
+            // Preview in angular order around the centre (screen space).
+            let mut sp: Vec<Vec2> = near.iter().filter_map(|v| pr.project(pts[*v as usize])).collect();
+            let c = sp.iter().copied().sum::<Vec2>() / sp.len() as f32;
+            sp.sort_by(|a, b| (a.y - c.y).atan2(a.x - c.x).total_cmp(&(b.y - c.y).atan2(b.x - c.x)));
+            let poly: Vec<Pos2> = sp.iter().map(|p| to_pos(*p)).collect();
+            painter.add(egui::Shape::convex_polygon(poly.clone(), Color32::from_rgba_unmultiplied(110, 255, 140, 50), Stroke::new(1.5, Color32::from_rgb(110, 255, 140))));
+        }
+    }
+    if let Some((a, b, start)) = app.qd.extend
+        && let (Some(pa), Some(pb), Some(ps)) = (pr.project(pts[a as usize]), pr.project(pts[b as usize]), pr.project(start))
+    {
+        let d = h - ps;
+        let poly = vec![to_pos(pa), to_pos(pb), to_pos(pb + d), to_pos(pa + d)];
+        painter.add(egui::Shape::closed_line(poly, Stroke::new(1.5, Color32::from_rgb(255, 220, 90))));
+    }
+    if app.qd.live.is_none() {
+        painter.text(to_pos(h) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, "no live object: dots land on meshes / the grid (Modify › Make Live)", egui::FontId::proportional(11.0), Color32::from_rgb(255, 200, 120));
+    }
 }
 
 /// One dab of the Paint Skin Weights brush at screen position `m`.
@@ -1124,6 +1326,7 @@ fn pick_object(app: &App, pr: &Projector, m: Vec2) -> Option<NodeId> {
                     }
             }
             Shape::Locator | Shape::IkHandle { .. } | Shape::ClusterHandle => wire(near_poly(&[origin], false, 8.0)),
+            Shape::Particles(_) => wire(near_poly(&[origin], false, 12.0)),
             Shape::Light(_) | Shape::Camera(_) => wire(near_poly(&[origin], false, 14.0)),
             Shape::Lattice { div, points } => {
                 for (a, b) in crate::deform::lattice_lines(*div, points) {
@@ -1137,8 +1340,9 @@ fn pick_object(app: &App, pr: &Projector, m: Vec2) -> Option<NodeId> {
                     wire(near_poly(&[origin, kp], false, 5.0));
                 }
             }
-            Shape::Curve { points, closed } => {
-                let pts: Vec<Vec3> = points.iter().map(|p| w.transform_point3(*p)).collect();
+            Shape::Curve { closed, .. } => {
+                let c = crate::nurbs::Curve::from_shape(&n.shape).unwrap();
+                let pts: Vec<Vec3> = c.tessellate(12).iter().map(|p| w.transform_point3(*p)).collect();
                 wire(near_poly(&pts, *closed, 6.0));
             }
             Shape::Group => {}
@@ -1286,7 +1490,7 @@ fn marquee_select(app: &mut App, pr: &Projector, r: Rect, mods: egui::Modifiers)
 
 /// Per-face and per-vertex "faces the camera" flags (for component display / picking).
 fn front_flags(app: &App, vid: usize, id: NodeId) -> (Vec<bool>, Vec<bool>) {
-    if let Some(Shape::Lattice { points, .. }) = app.scene.node(id).map(|n| &n.shape) {
+    if let Some(Shape::Lattice { points, .. } | Shape::Curve { points, .. }) = app.scene.node(id).map(|n| &n.shape) {
         return (Vec::new(), vec![true; points.len()]);
     }
     let Some(mesh) = app.scene.node(id).and_then(|n| n.mesh()) else { return (Vec::new(), Vec::new()) };
@@ -1320,6 +1524,19 @@ fn draw_components(app: &App, painter: &egui::Painter, pr: &Projector, vid: usiz
         let w = app.scene.world_matrix(id);
         if app.comp_mode == CompMode::Vertex {
             let Some(pts) = app.scene.node(id).and_then(|n| n.points()) else { continue };
+            // Curve hull (lines between CVs).
+            if let Some(Shape::Curve { closed, degree, .. }) = app.scene.node(id).map(|n| &n.shape)
+                && *degree > 1
+            {
+                let sp: Vec<Option<Pos2>> = pts.iter().map(|p| pr.project(w.transform_point3(*p)).map(to_pos)).collect();
+                let n = sp.len();
+                let segs = if *closed { n } else { n.saturating_sub(1) };
+                for i in 0..segs {
+                    if let (Some(a), Some(b)) = (sp[i], sp[(i + 1) % n]) {
+                        painter.line_segment([a, b], Stroke::new(1.0, Color32::from_rgb(150, 90, 150)));
+                    }
+                }
+            }
             let (_, vf) = front_flags(app, vid, id);
             for (i, p) in pts.iter().enumerate() {
                 let sel = app.comp_sel.contains(&(id, i as u32));

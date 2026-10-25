@@ -280,7 +280,24 @@ impl Writer<'_> {
             Shape::Poly { mesh, .. } if !mesh.faces.is_empty() => {
                 self.mesh(id, d, &shape_name, None);
             }
-            Shape::Curve { points: pts, closed } if !pts.is_empty() => {
+            Shape::Curve { points: pts, closed, degree, .. } if !pts.is_empty() && *degree > 1 => {
+                // Cubic (and other) NURBS curves.
+                self.counts[3] += 1;
+                let c = crate::nurbs::Curve::from_shape(&n.shape).unwrap();
+                let (cvs, order, knots, (a, b)) = crate::nurbs::to_usd(&c);
+                let _ = closed;
+                self.line(d, &format!("def NurbsCurves \"{shape_name}\""));
+                self.line(d, "{");
+                self.line(d + 1, &format!("int[] curveVertexCounts = [{}]", cvs.len()));
+                self.line(d + 1, &format!("point3f[] points = {}", points(&cvs)));
+                self.line(d + 1, &format!("int[] order = [{order}]"));
+                self.line(d + 1, &format!("double[] knots = [{}]", knots.iter().map(|k| format!("{k}")).collect::<Vec<_>>().join(", ")));
+                self.line(d + 1, &format!("double2[] ranges = [({a}, {b})]"));
+                self.line(d + 1, "float[] widths = [0.02] (interpolation = \"constant\")");
+                self.line(d + 1, &format!("color3f[] primvars:displayColor = [{}]", lin(n.color)));
+                self.line(d, "}");
+            }
+            Shape::Curve { points: pts, closed, .. } if !pts.is_empty() => {
                 self.counts[3] += 1;
                 self.line(d, &format!("def BasisCurves \"{shape_name}\""));
                 self.line(d, "{");
@@ -290,6 +307,26 @@ impl Writer<'_> {
                 self.line(d + 1, &format!("point3f[] points = {}", points(pts)));
                 self.line(d + 1, "float[] widths = [0.02] (interpolation = \"constant\")");
                 self.line(d + 1, &format!("color3f[] primvars:displayColor = [{}]", lin(n.color)));
+                self.line(d, "}");
+            }
+            Shape::Particles(ps) => {
+                // Points with per-frame positions (the count may change between samples).
+                let w = sc.world_matrix(id);
+                let inv = w.inverse();
+                let now: Vec<Vec3> = ps.current().iter().map(|q| inv.transform_point3(q.p)).collect();
+                self.line(d, &format!("def Points \"{shape_name}\""));
+                self.line(d, "{");
+                self.line(d + 1, &format!("point3f[] points = {}", points(&now)));
+                if let Some(pp) = self.baked.particles.get(&id).filter(|pp| pp.iter().any(|p| !p.is_empty())) {
+                    let fr = &self.baked.frames;
+                    let mut s = String::new();
+                    for (fi, p) in pp.iter().enumerate() {
+                        let _ = write!(s, "{}: {}, ", f(fr[fi]), points(p));
+                    }
+                    self.line(d + 1, &format!("point3f[] points.timeSamples = {{ {} }}", s.trim_end_matches(", ")));
+                }
+                self.line(d + 1, &format!("float[] widths = [{}] (interpolation = \"constant\")", f(ps.settings.radius * 2.0)));
+                self.line(d + 1, &format!("color3f[] primvars:displayColor = [{}]", lin(ps.settings.color)));
                 self.line(d, "}");
             }
             Shape::Light(l) => {
@@ -858,7 +895,7 @@ mod tests {
         assert!(s.contains("ShapingAPI"));
         assert!(s.contains("def DomeLight"));
         assert!(s.contains("def Camera \"camShape\""));
-        assert!(s.contains("def BasisCurves \"ctrlShape\""));
+        assert!(s.contains("def NurbsCurves \"ctrlShape\""));
         assert!(s.contains("rel material:binding = </World/Looks/red>"));
         // Balanced braces.
         assert_eq!(s.matches('{').count(), s.matches('}').count());

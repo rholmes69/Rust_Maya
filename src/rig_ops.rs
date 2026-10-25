@@ -188,7 +188,7 @@ impl App {
             points = rig::circle_points(size, n, 16);
         }
         self.checkpoint();
-        let id = self.scene.add_node(if shape == "circle" { "nurbsCircle" } else { "ctrl" }, Shape::Curve { points, closed }, None);
+        let id = self.scene.add_node(if shape == "circle" { "nurbsCircle" } else { "ctrl" }, Shape::Curve { points, closed, degree: 1, knots: Vec::new() }, None);
         self.apply_name(id, name);
         if let Some(n) = self.scene.node_mut(id) {
             n.color = [0.2, 0.55, 1.0];
@@ -573,7 +573,7 @@ impl App {
         if let Some(nr) = normal.filter(|_| shape == "circle") {
             pts = rig::circle_points(size, nr, 16);
         }
-        let id = self.scene.add_node(name, Shape::Curve { points: pts, closed }, parent);
+        let id = self.scene.add_node(name, Shape::Curve { points: pts, closed, degree: 1, knots: Vec::new() }, parent);
         self.apply_name(id, Some(name));
         rig::set_world_position(&mut self.scene, id, at);
         if let Some(n) = self.scene.node_mut(id) {

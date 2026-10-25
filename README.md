@@ -1,9 +1,10 @@
 # Rust Maya
 
 A Maya-style 3D content-creation app written in Rust with **egui** (UI) and **wgpu** (viewport rendering).
-It covers the **UI, polygon and edge modeling, keyframe animation, character rigging (with deformers and a one-click
-biped Quick Rig), look development (materials, lights, cameras, shadows), a path tracer, glTF / USD import and export and an AI copilot**.
-Simulation, NURBS, UVs and Arnold rendering show up in the menus as greyed-out "planned" items.
+It covers the **UI, polygon and edge modeling, NURBS curves with surface tools, Quad Draw retopology, keyframe
+animation, character rigging (with deformers and a one-click biped Quick Rig), look development (materials, lights,
+cameras, shadows), UVs, a path tracer, glTF / USD import and export and an AI copilot**, plus
+particles and cloth simulation. Fluids, hair and Arnold rendering show up in the menus as greyed-out "planned" items.
 
 ![screenshot](docs/screenshot.png)
 
@@ -147,7 +148,7 @@ File › Export All / Export Selection (glTF / USD), or `file -export path.glb|.
 | Format | What is written |
 |---|---|
 | **glTF 2.0** (`.glb` binary, `.gltf` with an embedded buffer) | Node hierarchy (joint orient folded into rotations), meshes with normals, PBR materials (metallic-roughness, emission, alpha blend, base colour / normal / packed metallic-roughness textures), skins (joints + inverse bind matrices, 4 influences), blend shapes as morph targets (with target names), baked animation of every node that moves over the playback range (including motion driven by constraints, IK and driven keys) and of morph weights, `KHR_lights_punctual` lights and perspective cameras. Validated with the Khronos glTF Validator (0 errors). |
-| **USD** (`.usda`) | Xform hierarchy, Mesh, BasisCurves (controls), UsdPreviewSurface materials with bindings, UsdLux lights (DistantLight, SphereLight, spot via ShapingAPI, DomeLight for ambient), Camera, transform animation as time samples. **Skinned meshes export as UsdSkel** (v1.3): a `SkelRoot` with a `Skeleton` (joint paths, bind and rest transforms), a `SkelAnimation` with per-frame joint translations, rotations and scales (including motion from IK, constraints and controls) and blend-shape weights, plus the mesh with `jointIndices`/`jointWeights`, `geomBindTransform` and `BlendShape` targets. Other deformers (clusters, lattices, wraps, blend-shape-only meshes) are **baked as per-frame points**; turn on File › *USD: bake skinning to points*, or use `-bp`, to bake skinned meshes too. Opens in `usdview` and any USD-aware DCC. |
+| **USD** (`.usda`) | Xform hierarchy, Mesh, BasisCurves (degree-1 curves and rig controls), NurbsCurves (cubic curves, v1.7), UsdPreviewSurface materials with bindings, UsdLux lights (DistantLight, SphereLight, spot via ShapingAPI, DomeLight for ambient), Camera, transform animation as time samples. **Skinned meshes export as UsdSkel** (v1.3): a `SkelRoot` with a `Skeleton` (joint paths, bind and rest transforms), a `SkelAnimation` with per-frame joint translations, rotations and scales (including motion from IK, constraints and controls) and blend-shape weights, plus the mesh with `jointIndices`/`jointWeights`, `geomBindTransform` and `BlendShape` targets. Other deformers (clusters, lattices, wraps, blend-shape-only meshes) are **baked as per-frame points**; turn on File › *USD: bake skinning to points*, or use `-bp`, to bake skinned meshes too. Opens in `usdview` and any USD-aware DCC. |
 
 The UsdSkel output was checked with Pixar's USD (`pip install usd-core`): `tools/check_usdskel.py skel.usda baked.usda` skins every mesh with UsdSkel at every frame and compares it with the point-baked export. A Quick-Rigged walk with an animated blend shape matches to within 0.00001 units over 120 frames, and the stage passes all of USD's validators. `cargo test usdskel_matches -- --ignored` runs the same check.
 
@@ -180,7 +181,7 @@ Tested against the Khronos sample models CesiumMan, Fox (3 takes), RiggedFigure,
 |---|---|
 | **Layers** | Text `.usda`, binary `.usdc` (read with the pure-Rust [openusd](https://crates.io/crates/openusd) crate), and `.usdz` packages, which are unpacked to a temp folder so their textures resolve. |
 | **Composition** | `subLayers`, `references` and `payload` (to other files or to prims in the same layer, with `defaultPrim`), `inherits` and `specializes`, and **variant sets** with their selections, including nested sets and selections made by the referencing prim. Opinions merge strongest first, in USD's LIVRPS order. `active = false` prims are skipped. |
-| **Geometry** | Xform hierarchy with every xformOp (translate, rotate*, orient, scale, transform, `!invert!`, animated → keys), Mesh (face-varying / vertex / uniform UVs with indices, left-handed orientation, displayColor), the intrinsic primitives Cube / Sphere / Cylinder / Cone / Capsule / Plane (with `axis`), BasisCurves, and **PointInstancer** (one group per instance with its position, orientation and scale). |
+| **Geometry** | Xform hierarchy with every xformOp (translate, rotate*, orient, scale, transform, `!invert!`, animated → keys), Mesh (face-varying / vertex / uniform UVs with indices, left-handed orientation, displayColor), the intrinsic primitives Cube / Sphere / Cylinder / Cone / Capsule / Plane (with `axis`), BasisCurves and NurbsCurves, and **PointInstancer** (one group per instance with its position, orientation and scale). |
 | **Looks** | UsdPreviewSurface networks (UsdUVTexture colour, normal, roughness, metallic, occlusion, emissive maps, UsdTransform2d repeat, through NodeGraph outputs), **MaterialX** (`.mtlx` files referenced from USD and inline `ND_standard_surface` / OpenPBR shaders: base colour, metalness, roughness, normal map, emission, opacity, transmission), and materials whose colour comes from the mesh's `displayColor` primvar (each mesh gets a tinted copy). Identical materials repeated across instanced assets are shared. EXR / HDR textures load too. |
 | **Characters** | **UsdSkel**: Skeleton → joints, SkelAnimation → keys, joint influences → skinCluster, BlendShape → blend-shape targets with weight curves. |
 | **Lights, cameras, stage** | UsdLux distant / sphere / spot (ShapingAPI) / rect (area) / dome lights, cameras (focal length, clipping, depth of field), frame rate and playback range. Z-up stages and `metersPerUnit` are converted to Y-up metres. |
@@ -215,9 +216,54 @@ The viewport splits very large scenes across several GPU vertex buffers, so mill
 | **Lattice** | Deform › Lattice (`lattice -dv 2 5 2`): a free-form deformation cage fitted around the selected meshes. Move, rotate or scale the lattice to carry the shape; in Vertex mode (F9) drag lattice points (soft select works too); `latticePoint ffd i j k x y z` scripts it; Attribute Editor › Reset Lattice. |
 | **Wrap** | Deform › Wrap: select the meshes to deform, then the low-res influence mesh last (`wrap -d cage hiRes`). Each vertex is bound to the closest cage triangle; editing, skinning or animating the cage deforms the high-res mesh. |
 
-Deformer order: blend shape → skin → clusters → lattices → wrap.
+Deformer order: blend shape → skin → clusters → lattices → wrap → wire.
 
 ![Sculpted ground with X symmetry and a lattice-flared sphere](docs/modeling.png)
+
+## Curves, surfaces, wire and Quad Draw (v1.7)
+
+![Revolved vase with its profile CVs, a loft through three circles, and a sheet bent by a wire curve](docs/curves.png)
+
+**NURBS curves** are non-rational B-splines: CVs, a degree (1 = linear, 3 = cubic, Maya's default) and a knot vector
+(clamped uniform for open curves, periodic for closed ones).
+
+| | |
+|---|---|
+| **Create** | Create › Curve Tools › **CV Curve Tool** / **EP Curve Tool**: click points, Backspace removes the last, Enter creates the curve, Esc cancels. Points land on the grid, or on the live object (Modify › Make Live); hold X to snap. EP curves pass through every point (global interpolation with chord-length parameters). Create › NURBS Primitives › **Circle** makes an exact-looking periodic cubic circle. MEL: `curve -d 3 -p 0 0 0 -p 1 1 0 …`, `curve -ep …`, `circle -r 1 -s 8 -nr 0 1 0`. |
+| **Edit** | Vertex mode (F9) edits CVs with the move/rotate/scale manipulators (soft select works), with the CV hull drawn. From MEL: `select crv.cv[2:4]; move -r 0 1 0`. The same component syntax works on meshes (`pCube1.vtx[0:3]`, `.e[5]`, `.f[*]`), and `pointPosition crv.cv[0]` reads a world position. |
+| **Curves menu** | **Rebuild** (uniform spans, degree 1/3; a least-squares fit with parameter correction), **Reverse Direction**, **Open/Close**, **Attach** (joins the nearest ends), **Detach** (exact knot insertion; `detachCurve crv.u[1.5]`). The Attribute Editor shows degree, spans, form, length and what each curve drives. |
+| **Surfaces menu** | **Revolve** (axis, sections, sweep), **Loft** (through two or more curves, cubic across sections, optional close), **Extrude** (a profile swept along a path with rotation-minimising frames, or straight by a length), **Planar** (fills a closed curve; ear-clipped when concave). The results are polygon meshes with UVs and **live construction history**: moving a CV, rebuilding or transforming an input curve rebuilds the mesh. The Attribute Editor edits sections, sweep and samples; Delete History freezes the mesh. |
+| **Wire deformer** | Deform › **Wire**: select the meshes, then the curve. Vertices within the dropoff distance (automatic, or `-dds 0 1.5`) follow the curve with a smooth falloff; the *rotation* setting turns them with the curve's tangent and *envelope* scales the effect. `wire -w crv -dds 0 1.5 mesh`, `wire -e -w crv -en 0.5`. |
+| **Quad Draw** | Mesh Tools › **Quad Draw** (the selected mesh becomes live): **click** to place dots on the live surface · **drag** a dot to move it (it stays on the surface) · **Shift+click** fills a quad from the four nearest dots, with a green preview while Shift is held · **Ctrl+Shift+click** fills a triangle · **Ctrl+drag a border edge** extends a new quad · **Ctrl+click** deletes a dot or face · **Relax** (Tool Settings) evens out interior dots and re-projects them. Enter or right-click finishes, removing unused dots. Faces wind consistently: they follow their neighbours, or point out of the live surface. MEL: `makeLive ref; quadDraw -dot x y z; quadDraw -quad 0 1 2 3; quadDraw -extend 1 2 0.5 0 0; quadDraw -relax 10; quadDraw -finish`. |
+
+![Quad Draw: two quads and an extended border quad on a live sphere](docs/quad_draw.png)
+
+Curves export to USD as `NurbsCurves` (order, knots, ranges; periodic curves in their wrapped form), which pass all of
+Pixar's USD validators, and import back with the same shape. Degree-1 curves (rig controls) stay `BasisCurves`. Saved
+scenes keep degrees, knots, surface history and wires; scenes from older versions load their curves as degree 1.
+
+## FX: particles and cloth (v1.8)
+
+![Particles bouncing off a rock and the ground, a sheet draped over a ball, and a pinned flag in the wind (path-traced)](docs/fx.png)
+
+Switch the menu set to **FX** (or use the FX shelf). Simulations run as the time slider moves: each frame is cached, so
+scrubbing back is instant and exact. Changing a setting, the animation of an emitter, pin target or collider, or a
+collider's mesh re-simulates from the start frame (the playback start when created). Emitters, pins and colliders follow
+the fully evaluated rig, including constraints, IK and skinning, so cloth can hang from a Quick Rig character.
+
+| | |
+|---|---|
+| **nParticles** | **Create Emitter** (omni), **Directional Emitter**, **Volume Emitter** (scale the emitter to size the box), **Emit from Object** (random points on a mesh, along its normals, or along a curve). Settings in the Attribute Editor: rate, speed (± random), spread, lifespan (± random), gravity, drag toward the **wind**, **turbulence** (strength, frequency), ground plane, bounce, friction, radius, start / end colour (by age), seed, substeps. Particles draw as small shaded octahedra, so they also render in the path tracer. |
+| **nCloth** | **Create nCloth** turns meshes into cloth (position-based dynamics: stretch, shear and bend constraints with substeps). Settings: stretch and bend resistance, damping, aerodynamic drag with **wind** (pushes along the cloth's normals, so flags and sails catch it), thickness, friction, gravity, ground plane, substeps / iterations. **Pin Selected Vertices** fixes vertices to the cloth's own transform, or to any joint, control or object (Attribute Editor › *Pins follow*). |
+| **Collisions** | **Make Collide**: select collider meshes, then the particle system or cloth. Particles test their path against the collider triangles each substep (no tunnelling); cloth keeps its thickness from the surface. Colliders can be animated or skinned. |
+| **Export** | USD: particles export as an animated `Points` prim (positions per frame, widths, colour); cloth exports as per-frame mesh points, like other deformers. Scenes save the settings; caches are rebuilt on load and come out identical. |
+
+MEL: `emitter -type omni|dir|surface|curve|volume -r 200 -spd 3 -sp 20 -dir 0 1 0 -lifespan 2 -n fx [sourceMesh]`,
+`setAttr fx.turbulence 2`, `getAttr fx.count`, `nCloth -stretch 1 -bend 0.1 cape`, `clothPin -to chest_jnt cape.vtx[0:12]`,
+`setAttr cape.wind 4 0 0`, `connectDynamic -c body cape`, `removeNCloth cape`.
+
+Speed on the 2-core test VM: a 41×41 cloth draped on a sphere simulates at about 39 ms/frame, and a 2,000 particles/s
+fountain (≈6,000 alive) with turbulence and a collider at about 3 ms/frame.
 
 ## Rendering: path tracer and Render View (v1.1)
 
@@ -334,6 +380,10 @@ set MOCK_AI=http://127.0.0.1:8765 && cargo test mock -- --ignored
 To try the UI against it, set the Ollama host to `http://127.0.0.1:8765`, the OpenRouter key to `sk-or-test`, and
 `"openrouter_url": "http://127.0.0.1:8765/api/v1"` in `ai_settings.json`.
 
+## Hardware and VPS
+
+See [docs/VPS_SPECS.md](docs/VPS_SPECS.md) for the specs needed to run Rust Maya and Ollama models on a VPS (or to host only Ollama there).
+
 ## Project layout
 
 ```
@@ -342,6 +392,11 @@ src/
   scene.rs       DAG nodes, channels, keyframe curves, layers, materials
   mesh.rs        n-gon mesh, primitives, extrude, Catmull-Clark, shells, OBJ I/O, deformed-normal fast path
   mesh_ops.rs    edge loops/rings, insert edge loop, bevel, bridge, merge, mirror, dissolve edge
+  nurbs.rs       B-spline curves (evaluate, interpolate, rebuild, detach/attach) and revolve/loft/extrude/planar with history
+  curve_ops.rs   undoable curve, surface and wire actions + their MEL commands
+  quad_draw.rs   Quad Draw retopology (live surface snapping, fill, extend, relax)
+  deform.rs      lattice, wrap and wire deformers
+  fx.rs          particles and cloth: emitters, forces, collisions, PBD cloth, per-frame caches, FX MEL
   modeling_ops.rs undoable edge-modeling actions
   prefs.rs       preferences, recent files, autosave and crash recovery
   look.rs        materials, lights, cameras, look-through, GPU light setup
@@ -365,9 +420,8 @@ src/
 ## Roadmap
 
 These items appear in the UI as disabled "planned" entries:
-- Deformers: wire
-- Modeling: Quad Draw, NURBS curves and surfaces
+- Modeling: NURBS surfaces as true NURBS (today surface tools output polygons), Reduce, Soften/Harden Edge
 - FBX, USD value clips, light-path passes (direct / indirect / specular)
-- FX: particles, cloth, fluids
+- FX: fluids, hair, fields as separate nodes, cloth self-collision
 
 *Not affiliated with Autodesk. Maya is a trademark of Autodesk, Inc.*

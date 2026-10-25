@@ -340,7 +340,18 @@ pub enum Shape {
     /// Lattice (FFD) cage: `div` points per axis, points in local space (-0.5..0.5 at rest).
     Lattice { div: [u32; 3], points: Vec<Vec3> },
     /// Control curve (linear NURBS-style curve used for rig controls).
-    Curve { points: Vec<Vec3>, closed: bool },
+    /// NURBS curve (non-rational B-spline): CVs, degree (1 = polyline; older scenes load as
+    /// degree 1) and the knot vector of open curves (empty = clamped uniform).
+    Curve {
+        points: Vec<Vec3>,
+        closed: bool,
+        #[serde(default = "crate::nurbs::default_degree")]
+        degree: u32,
+        #[serde(default)]
+        knots: Vec<f32>,
+    },
+    /// Particle system (emitter + simulation settings; the simulated particles are cached).
+    Particles(crate::fx::Particles),
     Poly {
         /// Construction history. `None` once history is deleted or components were edited.
         history: Option<Primitive>,
@@ -389,6 +400,15 @@ pub struct Node {
     /// Wrap deformer (this mesh follows an influence mesh).
     #[serde(default)]
     pub wrap: Option<crate::deform::WrapBind>,
+    /// Wire deformers (this mesh follows curves).
+    #[serde(default)]
+    pub wires: Vec<crate::deform::WireBind>,
+    /// Surface construction history (revolve / loft / extrude / planar from curves).
+    #[serde(default)]
+    pub surf: Option<crate::nurbs::SurfaceHistory>,
+    /// Cloth simulation (the simulated points replace this mesh's points).
+    #[serde(default)]
+    pub cloth: Option<crate::fx::Cloth>,
 }
 
 impl Node {
@@ -443,6 +463,9 @@ impl Node {
 
     /// Mutable mesh access. Bumps the revision and, if `drop_history`, removes construction history.
     pub fn mesh_mut(&mut self, drop_history: bool) -> Option<&mut Mesh> {
+        if drop_history && matches!(self.shape, Shape::Poly { .. }) {
+            self.surf = None;
+        }
         match &mut self.shape {
             Shape::Poly { mesh, rev, history } => {
                 *rev = next_rev();
@@ -474,6 +497,7 @@ impl Node {
         match &self.shape {
             Shape::Poly { mesh, .. } => Some(&mesh.positions),
             Shape::Lattice { points, .. } => Some(points),
+            Shape::Curve { points, .. } => Some(points),
             _ => None,
         }
     }
@@ -483,7 +507,7 @@ impl Node {
             return self.mesh_mut(true).map(|m| &mut m.positions);
         }
         match &mut self.shape {
-            Shape::Lattice { points, .. } => Some(points),
+            Shape::Lattice { points, .. } | Shape::Curve { points, .. } => Some(points),
             _ => None,
         }
     }
@@ -502,7 +526,7 @@ impl Node {
             Shape::Locator | Shape::Curve { .. } => Some(shape_name_for(&self.name)),
             Shape::Joint { .. } => None,
             Shape::IkHandle { .. } => None,
-            Shape::ClusterHandle | Shape::Light(_) | Shape::Camera(_) | Shape::Lattice { .. } => Some(format!("{}Shape", self.name)),
+            Shape::ClusterHandle | Shape::Light(_) | Shape::Camera(_) | Shape::Lattice { .. } | Shape::Particles(_) => Some(format!("{}Shape", self.name)),
             Shape::Poly { .. } => Some(shape_name_for(&self.name)),
         }
     }
@@ -622,6 +646,9 @@ impl Scene {
             material: None,
             lattices: Vec::new(),
             wrap: None,
+            wires: Vec::new(),
+            surf: None,
+            cloth: None,
         });
         id
     }

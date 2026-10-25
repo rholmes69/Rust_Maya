@@ -180,6 +180,7 @@ fn outliner_row(app: &mut App, ui: &mut egui::Ui, id: NodeId, depth: usize, drag
         Shape::Light(_) => ("☀", Color32::from_rgb(250, 220, 110)),
         Shape::Camera(_) => ("📷", Color32::from_rgb(200, 200, 210)),
         Shape::Lattice { .. } => ("▦", Color32::from_rgb(190, 140, 240)),
+        Shape::Particles(_) => ("✺", Color32::from_rgb(255, 180, 90)),
         Shape::Poly { .. } => ("◼", Color32::from_rgb(120, 200, 230)),
     };
     let visible = app.scene.is_visible(id);
@@ -745,7 +746,7 @@ pub fn attribute_editor(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(m.tri_count().to_string());
                 ui.end_row();
                 ui.label("History");
-                ui.label(if node.history().is_some() { "live" } else { "deleted" });
+                ui.label(if node.history().is_some() || node.surf.is_some() { "live" } else { "deleted" });
                 ui.end_row();
             });
         });
@@ -772,7 +773,214 @@ pub fn attribute_editor(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     }
-    if !node.lattices.is_empty() || node.wrap.is_some() {
+    if let Shape::Particles(ps) = &node.shape {
+        let mut st = ps.settings.clone();
+        let live = ps.current().len();
+        let mut changed = false;
+        egui::CollapsingHeader::new("nParticle").default_open(true).show(ui, |ui| {
+            let src = st.source.and_then(|i| app.scene.node(i)).map(|n| n.name.clone());
+            ui.label(format!("{} emitter{} · {live} live particles", st.kind.name(), src.map(|s| format!(" from {s}")).unwrap_or_default()));
+            let mut row = |ui: &mut egui::Ui, label: &str, v: &mut f32, speed: f64, lo: f32, hi: f32| {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    changed |= ui.add(egui::DragValue::new(v).speed(speed).range(lo..=hi)).changed();
+                });
+            };
+            row(ui, "Rate (/s)", &mut st.rate, 1.0, 0.0, 100_000.0);
+            row(ui, "Speed", &mut st.speed, 0.05, -1000.0, 1000.0);
+            row(ui, "Speed random", &mut st.speed_random, 0.01, 0.0, 1.0);
+            row(ui, "Spread (°)", &mut st.spread, 0.5, 0.0, 180.0);
+            row(ui, "Lifespan (s, 0 = ∞)", &mut st.lifespan, 0.05, 0.0, 1000.0);
+            row(ui, "Lifespan random", &mut st.lifespan_random, 0.01, 0.0, 1.0);
+            row(ui, "Radius", &mut st.radius, 0.002, 0.0005, 10.0);
+            row(ui, "Drag", &mut st.drag, 0.01, 0.0, 100.0);
+            row(ui, "Turbulence", &mut st.turbulence, 0.05, 0.0, 1000.0);
+            row(ui, "Turbulence freq.", &mut st.turbulence_freq, 0.05, 0.0, 100.0);
+            row(ui, "Bounce", &mut st.bounce, 0.01, 0.0, 1.0);
+            row(ui, "Friction", &mut st.friction, 0.01, 0.0, 1.0);
+            row(ui, "Start frame", &mut st.start, 1.0, -100_000.0, 100_000.0);
+            ui.horizontal(|ui| {
+                ui.label("Gravity");
+                for k in 0..3 {
+                    changed |= ui.add(egui::DragValue::new(&mut st.gravity[k]).speed(0.1)).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Wind");
+                for k in 0..3 {
+                    changed |= ui.add(egui::DragValue::new(&mut st.wind[k]).speed(0.1)).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut st.ground, "Ground plane").changed();
+                changed |= ui.add(egui::DragValue::new(&mut st.ground_height).speed(0.05)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Colour start / end");
+                changed |= ui.color_edit_button_rgb(&mut st.color).changed();
+                changed |= ui.color_edit_button_rgb(&mut st.color_end).changed();
+            });
+            let cols: Vec<String> = st.colliders.iter().filter_map(|i| app.scene.node(*i)).map(|n| n.name.clone()).collect();
+            ui.label(format!("Colliders: {}", if cols.is_empty() { "—".into() } else { cols.join(", ") }));
+        });
+        if changed {
+            app.edit_checkpoint(egui::Id::unique(("ae_particles", lead)));
+            if let Some(Shape::Particles(p)) = app.scene.node_mut(lead).map(|n| &mut n.shape) {
+                p.settings = st;
+            }
+        }
+    }
+    if let Some(cl) = node.cloth.clone() {
+        let mut st = cl.settings.clone();
+        let mut changed = false;
+        egui::CollapsingHeader::new("nCloth").default_open(true).show(ui, |ui| {
+            let mut row = |ui: &mut egui::Ui, label: &str, v: &mut f32, speed: f64, lo: f32, hi: f32| {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    changed |= ui.add(egui::DragValue::new(v).speed(speed).range(lo..=hi)).changed();
+                });
+            };
+            row(ui, "Stretch resistance", &mut st.stretch, 0.01, 0.0, 1.0);
+            row(ui, "Bend resistance", &mut st.bend, 0.01, 0.0, 1.0);
+            row(ui, "Damping", &mut st.damping, 0.005, 0.0, 1.0);
+            row(ui, "Air drag", &mut st.drag, 0.05, 0.0, 100.0);
+            row(ui, "Thickness", &mut st.thickness, 0.001, 0.0, 10.0);
+            row(ui, "Friction", &mut st.friction, 0.01, 0.0, 1.0);
+            row(ui, "Start frame", &mut st.start, 1.0, -100_000.0, 100_000.0);
+            ui.horizontal(|ui| {
+                ui.label("Substeps");
+                changed |= ui.add(egui::DragValue::new(&mut st.substeps).range(1..=64)).changed();
+                ui.label("Iterations");
+                changed |= ui.add(egui::DragValue::new(&mut st.iterations).range(1..=32)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Gravity");
+                for k in 0..3 {
+                    changed |= ui.add(egui::DragValue::new(&mut st.gravity[k]).speed(0.1)).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Wind");
+                for k in 0..3 {
+                    changed |= ui.add(egui::DragValue::new(&mut st.wind[k]).speed(0.1)).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut st.ground, "Ground plane").changed();
+                changed |= ui.add(egui::DragValue::new(&mut st.ground_height).speed(0.05)).changed();
+            });
+            ui.label(format!("{} pinned vertices", st.pins.len()));
+            let current = st.pin_to.and_then(|i| app.scene.node(i)).map(|n| n.name.clone()).unwrap_or_else(|| "(its own transform)".into());
+            let candidates: Vec<(NodeId, String)> = app.scene.nodes.iter().filter(|n| n.id != lead && !matches!(n.shape, Shape::Poly { .. })).map(|n| (n.id, n.name.clone())).collect();
+            egui::ComboBox::from_label("Pins follow").selected_text(current).show_ui(ui, |ui| {
+                if ui.selectable_label(st.pin_to.is_none(), "(its own transform)").clicked() {
+                    st.pin_to = None;
+                    changed = true;
+                }
+                for (id, n) in &candidates {
+                    if ui.selectable_label(st.pin_to == Some(*id), n).clicked() {
+                        st.pin_to = Some(*id);
+                        changed = true;
+                    }
+                }
+            });
+            let cols: Vec<String> = st.colliders.iter().filter_map(|i| app.scene.node(*i)).map(|n| n.name.clone()).collect();
+            ui.label(format!("Colliders: {}", if cols.is_empty() { "—".into() } else { cols.join(", ") }));
+            if ui.button("Remove nCloth").clicked() {
+                app.remove_cloth(&[lead]);
+            }
+        });
+        if changed {
+            app.edit_checkpoint(egui::Id::unique(("ae_cloth", lead)));
+            if let Some(c) = app.scene.node_mut(lead).and_then(|n| n.cloth.as_mut()) {
+                c.settings = st;
+            }
+        }
+    }
+    if let Some(c) = crate::nurbs::Curve::from_shape(&node.shape) {
+        egui::CollapsingHeader::new("nurbsCurve").default_open(true).show(ui, |ui| {
+            let form = if c.closed { "periodic" } else { "open" };
+            ui.label(format!("Degree {} · {} CVs · {} spans · {form}", c.degree, c.cvs.len(), c.spans()));
+            if let Some(w) = crate::nurbs::world_curve(&app.scene, lead) {
+                let (a, b) = w.domain();
+                ui.label(format!("Length {:.3} · parameter range {a:.2} … {b:.2}", w.length()));
+            }
+            let users: Vec<String> = app.scene.nodes.iter().filter(|n| n.surf.as_ref().is_some_and(|h| h.inputs.contains(&lead)) || n.wires.iter().any(|w| w.curve == lead)).map(|n| n.name.clone()).collect();
+            if !users.is_empty() {
+                ui.label(format!("Drives: {}", users.join(", ")));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Rebuild").clicked() {
+                    let (sp, d) = (app.curve_opts.rebuild_spans as usize, app.curve_opts.rebuild_degree as usize);
+                    let r = app.rebuild_curves(&[lead], sp, d).map(|_| String::new());
+                    super::report(app, r);
+                }
+                ui.add(egui::DragValue::new(&mut app.curve_opts.rebuild_spans).range(1..=256).suffix(" spans"));
+                if ui.button("Reverse").clicked() {
+                    let _ = app.reverse_curves(&[lead]);
+                }
+                if ui.button(if c.closed { "Open" } else { "Close" }).clicked() {
+                    let _ = app.open_close_curves(&[lead]);
+                }
+            });
+            ui.label(RichText::new("Vertex mode (F9) edits CVs.").weak());
+        });
+    }
+    if let Some(h) = node.surf.clone() {
+        egui::CollapsingHeader::new(h.op_name()).default_open(true).show(ui, |ui| {
+            let ins: Vec<String> = h.inputs.iter().filter_map(|i| app.scene.node(*i)).map(|n| n.name.clone()).collect();
+            ui.label(format!("Inputs: {}", ins.join(", ")));
+            let mut op = h.op.clone();
+            let mut samples = h.samples;
+            let mut changed = false;
+            match &mut op {
+                crate::nurbs::SurfaceOp::Revolve { sections, sweep, .. } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Sections");
+                        changed |= ui.add(egui::DragValue::new(sections).range(3..=256)).changed();
+                        ui.label("Sweep");
+                        changed |= ui.add(egui::DragValue::new(sweep).range(-360.0..=360.0).suffix("°")).changed();
+                    });
+                }
+                crate::nurbs::SurfaceOp::Loft { sections, close } => {
+                    ui.horizontal(|ui| {
+                        ui.label("Section spans");
+                        changed |= ui.add(egui::DragValue::new(sections).range(1..=64)).changed();
+                        changed |= ui.checkbox(close, "Close").changed();
+                    });
+                }
+                crate::nurbs::SurfaceOp::Extrude { length, .. } => {
+                    if h.inputs.len() < 2 {
+                        ui.horizontal(|ui| {
+                            ui.label("Length");
+                            changed |= ui.add(egui::DragValue::new(length).speed(0.05)).changed();
+                        });
+                    }
+                }
+                crate::nurbs::SurfaceOp::Planar => {}
+            }
+            ui.horizontal(|ui| {
+                ui.label("Samples per curve");
+                changed |= ui.add(egui::DragValue::new(&mut samples).range(3..=512)).changed();
+            });
+            if changed {
+                app.edit_checkpoint(egui::Id::unique(("ae_surf", lead)));
+                if let Some(s) = app.scene.node_mut(lead).and_then(|n| n.surf.as_mut()) {
+                    s.op = op;
+                    s.samples = samples;
+                    s.key = 0;
+                }
+            }
+            if ui.button("Delete History").clicked() {
+                app.checkpoint();
+                if let Some(n) = app.scene.node_mut(lead) {
+                    n.surf = None;
+                }
+            }
+            ui.label(RichText::new("Editing the input curves rebuilds this mesh.").weak());
+        });
+    }
+    if !node.lattices.is_empty() || node.wrap.is_some() || !node.wires.is_empty() {
         egui::CollapsingHeader::new("Deformers").default_open(true).show(ui, |ui| {
             for b in &node.lattices {
                 ui.label(format!("ffd → {}", app.scene.node(b.lattice).map(|n| n.name.as_str()).unwrap_or("?")));
@@ -780,7 +988,26 @@ pub fn attribute_editor(app: &mut App, ui: &mut egui::Ui) {
             if let Some(w) = &node.wrap {
                 ui.label(format!("wrap → {}", app.scene.node(w.driver).map(|n| n.name.as_str()).unwrap_or("?")));
             }
-            if ui.button("Remove Lattice / Wrap").clicked() {
+            for (k, w) in node.wires.iter().enumerate() {
+                let cname = app.scene.node(w.curve).map(|n| n.name.clone()).unwrap_or("?".into());
+                ui.label(format!("wire → {cname} ({} vertices, dropoff {:.2})", w.binds.len(), w.dropoff));
+                let (mut en, mut rot) = (w.envelope, w.rotation);
+                let (c1, c2) = ui.horizontal(|ui| {
+                    ui.label("Envelope");
+                    let c1 = ui.add(egui::Slider::new(&mut en, 0.0..=1.0)).changed();
+                    ui.label("Rotation");
+                    let c2 = ui.add(egui::Slider::new(&mut rot, 0.0..=1.0)).changed();
+                    (c1, c2)
+                }).inner;
+                if c1 || c2 {
+                    app.edit_checkpoint(egui::Id::unique(("ae_wire", lead, k)));
+                    if let Some(x) = app.scene.node_mut(lead).and_then(|n| n.wires.get_mut(k)) {
+                        x.envelope = en;
+                        x.rotation = rot;
+                    }
+                }
+            }
+            if ui.button("Remove Lattice / Wrap / Wire").clicked() {
                 app.remove_lattice_and_wrap(&[lead]);
             }
         });
@@ -839,6 +1066,63 @@ fn tool_settings(app: &mut App, ui: &mut egui::Ui) {
             });
             ui.checkbox(&mut app.sculpt.symmetry_x, "Symmetry X");
             ui.checkbox(&mut app.sculpt.invert, "Invert (or hold Ctrl)");
+        });
+    }
+    if app.tool == Tool::QuadDraw {
+        egui::CollapsingHeader::new("Quad Draw").default_open(true).show(ui, |ui| {
+            let live = app.qd.live.and_then(|l| app.scene.node(l)).map(|n| n.name.clone()).unwrap_or_else(|| "none".into());
+            ui.horizontal(|ui| {
+                ui.label(format!("Live object: {live}"));
+                if ui.button("Make selected live").clicked() {
+                    let id = app.lead().filter(|i| Some(*i) != app.qd.target);
+                    let r = app.qd_make_live(id).map(|_| String::new());
+                    super::report(app, r);
+                }
+            });
+            let (nv, nf) = app.qd.target.and_then(|t| app.scene.node(t)).and_then(|n| n.mesh()).map(|m| (m.positions.len(), m.faces.len())).unwrap_or((0, 0));
+            ui.label(format!("{nv} dots, {nf} faces"));
+            ui.horizontal(|ui| {
+                ui.label("Surface offset");
+                ui.add(egui::DragValue::new(&mut app.qd.offset).speed(0.0002).range(0.0..=0.05));
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Relax").clicked() {
+                    let n = app.qd.relax_iters;
+                    let r = app.qd_relax(n).map(|n| format!("Relaxed {n} dot(s)"));
+                    super::report(app, r);
+                }
+                ui.add(egui::DragValue::new(&mut app.qd.relax_iters).range(1..=100).suffix(" iterations"));
+            });
+            ui.horizontal(|ui| {
+                if ui.button("New mesh").clicked() {
+                    app.qd.target = None;
+                }
+                if ui.button("Finish").clicked() {
+                    app.qd_finish();
+                    app.tool = Tool::Select;
+                }
+            });
+            ui.label(RichText::new("Click: dot · drag dot: move · Shift+click: quad from the 4 nearest dots (Ctrl+Shift: triangle) · Ctrl+drag border edge: extend · Ctrl+click: delete dot/face · Enter or RMB: finish").weak());
+        });
+    }
+    if matches!(app.tool, Tool::CurveCv | Tool::CurveEp) {
+        egui::CollapsingHeader::new(if app.tool == Tool::CurveCv { "CV Curve" } else { "EP Curve" }).default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Degree");
+                ui.radio_value(&mut app.curve_tool.degree, 1, "1 Linear");
+                ui.radio_value(&mut app.curve_tool.degree, 3, "3 Cubic");
+            });
+            ui.label(format!("{} point(s)", app.curve_tool.points.len()));
+            ui.horizontal(|ui| {
+                if ui.button("Create").clicked() {
+                    let r = app.finish_curve_tool().map(|_| String::new());
+                    super::report(app, r);
+                }
+                if ui.button("Clear").clicked() {
+                    app.curve_tool.points.clear();
+                }
+            });
+            ui.label(RichText::new("Points land on the live object (Modify › Make Live) or the grid; hold X to snap. Backspace removes the last point.").weak());
         });
     }
     if app.tool == Tool::MultiCut {
