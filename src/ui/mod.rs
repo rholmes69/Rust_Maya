@@ -401,7 +401,8 @@ impl Shell {
                 }
                 Action::ImportObj => {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("All supported", &["glb", "gltf", "usd", "usda", "usdc", "usdz", "obj"])
+                        .add_filter("All supported", &["fbx", "glb", "gltf", "usd", "usda", "usdc", "usdz", "obj"])
+                        .add_filter("FBX", &["fbx"])
                         .add_filter("glTF 2.0", &["glb", "gltf"])
                         .add_filter("USD", &["usd", "usda", "usdc", "usdz"])
                         .add_filter("Wavefront OBJ", &["obj"])
@@ -420,6 +421,7 @@ impl Shell {
                     let stem = app.file_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or("scene".into());
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("glTF binary", &["glb"])
+                        .add_filter("FBX (binary 7.4)", &["fbx"])
                         .add_filter("glTF (embedded)", &["gltf"])
                         .add_filter("USD ASCII", &["usda"])
                         .set_file_name(format!("{stem}.glb"))

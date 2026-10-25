@@ -15,6 +15,10 @@ pub struct Mesh {
     /// Per face, the UV index of each corner (parallel to `faces`). Empty = no UVs.
     #[serde(default)]
     pub face_uvs: Vec<Vec<u32>>,
+    /// Explicit hard edges (sorted vertex pairs). `None` = automatic: edges whose faces meet
+    /// at more than 60° are hard. Set by Soften/Harden Edge and by importers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_edges: Option<std::collections::BTreeSet<(u32, u32)>>,
 }
 
 /// Triangulated, render-ready version of a mesh (in object space).
@@ -201,28 +205,153 @@ impl Mesh {
         out
     }
 
-    /// Fan-triangulate with angle-based (soft/hard edge, 60°) vertex normals.
-    pub fn triangulate(&self) -> TriMesh {
+    /// Normal of every face corner (parallel to `faces`): smooth across soft edges, split at
+    /// hard ones (explicit `hard_edges`, or faces meeting at more than 60°).
+    pub fn corner_normals(&self) -> Vec<Vec<Vec3>> {
         let face_n: Vec<Vec3> = (0..self.faces.len()).map(|f| self.face_normal(f)).collect();
         let mut vert_faces: Vec<Vec<u32>> = vec![Vec::new(); self.positions.len()];
         for (fi, f) in self.faces.iter().enumerate() {
             for &v in f {
-                vert_faces[v as usize].push(fi as u32);
-            }
-        }
-        let cos_thresh = 60f32.to_radians().cos();
-        let corner_normal = |fi: usize, v: u32| -> Vec3 {
-            let n0 = face_n[fi];
-            let mut acc = Vec3::ZERO;
-            for &of in &vert_faces[v as usize] {
-                let n = face_n[of as usize];
-                if n.dot(n0) >= cos_thresh {
-                    acc += n;
+                if let Some(x) = vert_faces.get_mut(v as usize) {
+                    x.push(fi as u32);
                 }
             }
-            let r = acc.normalize_or_zero();
-            if r == Vec3::ZERO { n0 } else { r }
-        };
+        }
+        match &self.hard_edges {
+            None => {
+                let cos_thresh = 60f32.to_radians().cos();
+                self.faces
+                    .iter()
+                    .enumerate()
+                    .map(|(fi, f)| {
+                        let n0 = face_n[fi];
+                        f.iter()
+                            .map(|&v| {
+                                let mut acc = Vec3::ZERO;
+                                for &of in &vert_faces[v as usize] {
+                                    let n = face_n[of as usize];
+                                    if n.dot(n0) >= cos_thresh {
+                                        acc += n;
+                                    }
+                                }
+                                let r = acc.normalize_or_zero();
+                                if r == Vec3::ZERO { n0 } else { r }
+                            })
+                            .collect()
+                    })
+                    .collect()
+            }
+            Some(hard) => {
+                // Per vertex, group its faces that connect across soft edges (union-find).
+                let edge_of = |f: &Vec<u32>, v: u32| -> [(u32, u32); 2] {
+                    let i = f.iter().position(|x| *x == v).unwrap();
+                    let (p, n) = (f[(i + f.len() - 1) % f.len()], f[(i + 1) % f.len()]);
+                    [(v.min(p), v.max(p)), (v.min(n), v.max(n))]
+                };
+                let mut group_normal: HashMap<(u32, u32), Vec3> = HashMap::new(); // (vertex, face) → normal
+                for (v, fs) in vert_faces.iter().enumerate() {
+                    let v = v as u32;
+                    if fs.is_empty() {
+                        continue;
+                    }
+                    let mut parent: Vec<usize> = (0..fs.len()).collect();
+                    fn find(p: &mut [usize], x: usize) -> usize {
+                        let mut r = x;
+                        while p[r] != r {
+                            r = p[r];
+                        }
+                        let mut y = x;
+                        while p[y] != r {
+                            let nx = p[y];
+                            p[y] = r;
+                            y = nx;
+                        }
+                        r
+                    }
+                    let edges: Vec<[(u32, u32); 2]> = fs.iter().map(|f| edge_of(&self.faces[*f as usize], v)).collect();
+                    for a in 0..fs.len() {
+                        for b in a + 1..fs.len() {
+                            let shared = edges[a].iter().find(|e| edges[b].contains(e));
+                            if let Some(e) = shared
+                                && !hard.contains(e)
+                            {
+                                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                                parent[ra] = rb;
+                            }
+                        }
+                    }
+                    let mut acc: HashMap<usize, Vec3> = HashMap::new();
+                    for (k, f) in fs.iter().enumerate() {
+                        let r = find(&mut parent, k);
+                        *acc.entry(r).or_default() += face_n[*f as usize];
+                    }
+                    for (k, f) in fs.iter().enumerate() {
+                        let r = find(&mut parent, k);
+                        let n = acc[&r].normalize_or_zero();
+                        group_normal.insert((v, *f), if n == Vec3::ZERO { face_n[*f as usize] } else { n });
+                    }
+                }
+                self.faces.iter().enumerate().map(|(fi, f)| f.iter().map(|&v| group_normal.get(&(v, fi as u32)).copied().unwrap_or(face_n[fi])).collect()).collect()
+            }
+        }
+    }
+
+    /// The hard edges in effect (explicit, or by the automatic 60° rule).
+    pub fn effective_hard_edges(&self) -> std::collections::BTreeSet<(u32, u32)> {
+        if let Some(h) = &self.hard_edges {
+            return h.clone();
+        }
+        let cos_thresh = 60f32.to_radians().cos();
+        let mut edge_faces: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (fi, f) in self.faces.iter().enumerate() {
+            for i in 0..f.len() {
+                let (a, b) = (f[i], f[(i + 1) % f.len()]);
+                edge_faces.entry((a.min(b), a.max(b))).or_default().push(fi);
+            }
+        }
+        edge_faces.into_iter().filter(|(_, fs)| fs.len() == 2 && self.face_normal(fs[0]).dot(self.face_normal(fs[1])) < cos_thresh).map(|(e, _)| e).collect()
+    }
+
+    /// Soften (`hard = false`) or harden edges; `None` = every edge. Angle-based softening:
+    /// `soften_by_angle` marks edges hard where faces meet at more than `deg`.
+    pub fn set_edges_hard(&mut self, edges: Option<&[(u32, u32)]>, hard: bool) {
+        let mut set = self.effective_hard_edges();
+        match edges {
+            Some(es) => {
+                for (a, b) in es {
+                    let e = ((*a).min(*b), (*a).max(*b));
+                    if hard {
+                        set.insert(e);
+                    } else {
+                        set.remove(&e);
+                    }
+                }
+            }
+            None => {
+                set.clear();
+                if hard {
+                    set.extend(self.edges());
+                }
+            }
+        }
+        self.hard_edges = Some(set);
+    }
+
+    pub fn soften_by_angle(&mut self, deg: f32) {
+        let c = deg.clamp(0.0, 180.0).to_radians().cos();
+        let mut edge_faces: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (fi, f) in self.faces.iter().enumerate() {
+            for i in 0..f.len() {
+                let (a, b) = (f[i], f[(i + 1) % f.len()]);
+                edge_faces.entry((a.min(b), a.max(b))).or_default().push(fi);
+            }
+        }
+        self.hard_edges = Some(edge_faces.into_iter().filter(|(_, fs)| fs.len() != 2 || self.face_normal(fs[0]).dot(self.face_normal(fs[1])) < c - 1e-6).map(|(e, _)| e).collect());
+    }
+
+    /// Fan-triangulate with soft/hard edge vertex normals.
+    pub fn triangulate(&self) -> TriMesh {
+        let cn = self.corner_normals();
         let mut t = TriMesh::default();
         let has_uv = self.has_uvs();
         for (fi, f) in self.faces.iter().enumerate() {
@@ -233,7 +362,7 @@ impl Mesh {
                 for k in [0, i, i + 1] {
                     let v = f[k];
                     t.pos.push(self.positions[v as usize]);
-                    t.nrm.push(corner_normal(fi, v));
+                    t.nrm.push(cn[fi][k]);
                     t.vert.push(v);
                     if has_uv {
                         t.uv.push(self.uvs[self.face_uvs[fi][k] as usize]);
@@ -530,7 +659,7 @@ impl Mesh {
         if !had {
             uvs.clear();
         }
-        Mesh { positions: new_pos, faces, uvs, face_uvs }
+        Mesh { positions: new_pos, faces, uvs, face_uvs, hard_edges: None }
     }
 
     /// Append another mesh (already in the same space).
@@ -990,7 +1119,7 @@ pub fn from_obj(text: &str) -> Vec<(String, Mesh)> {
                 Some(u) if !all_uv.is_empty() => (all_uv.clone(), u),
                 _ => (Vec::new(), Vec::new()),
             };
-            let mut m = Mesh { positions: all_pos.clone(), faces, uvs, face_uvs };
+            let mut m = Mesh { positions: all_pos.clone(), faces, uvs, face_uvs, hard_edges: None };
             m.compact();
             (name, m)
         })

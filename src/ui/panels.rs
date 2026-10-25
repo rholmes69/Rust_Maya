@@ -181,6 +181,8 @@ fn outliner_row(app: &mut App, ui: &mut egui::Ui, id: NodeId, depth: usize, drag
         Shape::Camera(_) => ("📷", Color32::from_rgb(200, 200, 210)),
         Shape::Lattice { .. } => ("▦", Color32::from_rgb(190, 140, 240)),
         Shape::Particles(_) => ("✺", Color32::from_rgb(255, 180, 90)),
+        Shape::Field(_) => ("➶", Color32::from_rgb(140, 230, 200)),
+        Shape::Hair(_) => ("〰", Color32::from_rgb(220, 170, 120)),
         Shape::Poly { .. } => ("◼", Color32::from_rgb(120, 200, 230)),
     };
     let visible = app.scene.is_visible(id);
@@ -830,6 +832,131 @@ pub fn attribute_editor(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     }
+    if let Shape::Field(f) = &node.shape {
+        let mut st = f.clone();
+        let mut changed = false;
+        egui::CollapsingHeader::new("Field").default_open(true).show(ui, |ui| {
+            egui::ComboBox::from_label("Type").selected_text(st.kind.name()).show_ui(ui, |ui| {
+                for k in crate::fx::FieldKind::ALL {
+                    if ui.selectable_label(st.kind == k, k.name()).clicked() && st.kind != k {
+                        let keep = st.targets.clone();
+                        st = crate::fx::Field::new(k);
+                        st.targets = keep;
+                        changed = true;
+                    }
+                }
+            });
+            changed |= ae_row(ui, "Magnitude", &mut st.magnitude, 0.05, -10_000.0, 10_000.0);
+            changed |= ae_row(ui, "Attenuation", &mut st.attenuation, 0.05, 0.0, 10.0);
+            changed |= ae_row(ui, "Max distance (0 = ∞)", &mut st.max_distance, 0.05, 0.0, 100_000.0);
+            match st.kind {
+                crate::fx::FieldKind::Turbulence => {
+                    changed |= ae_row(ui, "Frequency", &mut st.frequency, 0.05, 0.0, 100.0);
+                    changed |= ae_row(ui, "Phase speed", &mut st.speed, 0.05, 0.0, 100.0);
+                }
+                crate::fx::FieldKind::Air => changed |= ae_row(ui, "Speed (how fast things reach the wind)", &mut st.speed, 0.05, 0.0, 100.0),
+                _ => {}
+            }
+            if !matches!(st.kind, crate::fx::FieldKind::Radial | crate::fx::FieldKind::Newton | crate::fx::FieldKind::Turbulence | crate::fx::FieldKind::Drag) {
+                ui.horizontal(|ui| {
+                    ui.label(if st.kind == crate::fx::FieldKind::Vortex { "Axis" } else { "Direction" });
+                    for k in 0..3 {
+                        changed |= ui.add(egui::DragValue::new(&mut st.direction[k]).speed(0.05)).changed();
+                    }
+                });
+            }
+            let names: Vec<String> = st.targets.iter().filter_map(|i| app.scene.node(*i)).map(|n| n.name.clone()).collect();
+            ui.label(format!("Acts on: {}", if names.is_empty() { "every simulation".into() } else { names.join(", ") }));
+            if !st.targets.is_empty() && ui.button("Act on every simulation").clicked() {
+                st.targets.clear();
+                changed = true;
+            }
+        });
+        if changed {
+            app.edit_checkpoint(egui::Id::unique(("ae_field", lead)));
+            if let Some(Shape::Field(f)) = app.scene.node_mut(lead).map(|n| &mut n.shape) {
+                *f = st;
+            }
+        }
+    }
+    if let Shape::Hair(h) = &node.shape {
+        let mut st = h.settings.clone();
+        let strands = h.strands().len();
+        let mut changed = false;
+        egui::CollapsingHeader::new("Hair").default_open(true).show(ui, |ui| {
+            let src = st.source.and_then(|i| app.scene.node(i)).map(|n| n.name.clone()).unwrap_or_else(|| "—".into());
+            let dynamic_curve = st.output.is_some();
+            ui.label(if dynamic_curve { format!("Dynamic curve from {src}") } else { format!("{strands} strands on {src}") });
+            if !dynamic_curve {
+                ui.horizontal(|ui| {
+                    ui.label("Count");
+                    changed |= ui.add(egui::DragValue::new(&mut st.count).range(1..=200_000)).changed();
+                });
+                changed |= ae_row(ui, "Length", &mut st.length, 0.005, 0.0001, 1000.0);
+                changed |= ae_row(ui, "Length random", &mut st.length_random, 0.01, 0.0, 1.0);
+                changed |= ae_row(ui, "Tilt (°)", &mut st.tilt, 0.5, 0.0, 90.0);
+                changed |= ae_row(ui, "Curl (°)", &mut st.curl, 0.5, 0.0, 720.0);
+                changed |= ae_row(ui, "Comb amount", &mut st.comb_amount, 0.01, 0.0, 1.0);
+                ui.horizontal(|ui| {
+                    ui.label("Comb direction");
+                    for k in 0..3 {
+                        changed |= ui.add(egui::DragValue::new(&mut st.comb[k]).speed(0.05)).changed();
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Segments");
+                changed |= ui.add(egui::DragValue::new(&mut st.segments).range(1..=64)).changed();
+            });
+            changed |= ae_row(ui, "Stiffness (root)", &mut st.stiffness, 0.005, 0.0, 1.0);
+            changed |= ae_row(ui, "Stiffness (tip)", &mut st.tip_stiffness, 0.005, 0.0, 1.0);
+            changed |= ae_row(ui, "Damping", &mut st.damping, 0.005, 0.0, 1.0);
+            changed |= ae_row(ui, "Air drag", &mut st.drag, 0.05, 0.0, 100.0);
+            changed |= ae_row(ui, "Collision thickness", &mut st.thickness, 0.001, 0.0, 10.0);
+            changed |= ae_row(ui, "Width (root)", &mut st.width, 0.0005, 0.00001, 10.0);
+            changed |= ae_row(ui, "Width (tip)", &mut st.tip_width, 0.0005, 0.0, 10.0);
+            changed |= ae_row(ui, "Start frame", &mut st.start, 1.0, -100_000.0, 100_000.0);
+            ui.horizontal(|ui| {
+                ui.label("Substeps");
+                changed |= ui.add(egui::DragValue::new(&mut st.substeps).range(1..=32)).changed();
+                ui.label("Iterations");
+                changed |= ui.add(egui::DragValue::new(&mut st.iterations).range(1..=32)).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Gravity");
+                for k in 0..3 {
+                    changed |= ui.add(egui::DragValue::new(&mut st.gravity[k]).speed(0.1)).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Wind");
+                for k in 0..3 {
+                    changed |= ui.add(egui::DragValue::new(&mut st.wind[k]).speed(0.1)).changed();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Colour root / tip");
+                changed |= ui.color_edit_button_rgb(&mut st.color).changed();
+                changed |= ui.color_edit_button_rgb(&mut st.tip_color).changed();
+            });
+            ui.horizontal(|ui| {
+                if dynamic_curve {
+                    changed |= ui.checkbox(&mut st.pin_tip, "Pin the tip too").changed();
+                } else {
+                    changed |= ui.checkbox(&mut st.collide_source, "Collide with the mesh").changed();
+                }
+                changed |= ui.checkbox(&mut st.ground, "Ground plane").changed();
+            });
+            let cols: Vec<String> = st.colliders.iter().filter_map(|i| app.scene.node(*i)).map(|n| n.name.clone()).collect();
+            ui.label(format!("Colliders: {}", if cols.is_empty() { "—".into() } else { cols.join(", ") }));
+        });
+        if changed {
+            app.edit_checkpoint(egui::Id::unique(("ae_hair", lead)));
+            if let Some(Shape::Hair(h)) = app.scene.node_mut(lead).map(|n| &mut n.shape) {
+                h.settings = st;
+            }
+        }
+    }
     if let Some(cl) = node.cloth.clone() {
         let mut st = cl.settings.clone();
         let mut changed = false;
@@ -847,6 +974,11 @@ pub fn attribute_editor(app: &mut App, ui: &mut egui::Ui) {
             row(ui, "Thickness", &mut st.thickness, 0.001, 0.0, 10.0);
             row(ui, "Friction", &mut st.friction, 0.01, 0.0, 1.0);
             row(ui, "Start frame", &mut st.start, 1.0, -100_000.0, 100_000.0);
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut st.self_collide, "Self collision").changed();
+                ui.label("radius (0 = auto)");
+                changed |= ui.add(egui::DragValue::new(&mut st.self_thickness).speed(0.001).range(0.0..=10.0)).changed();
+            });
             ui.horizontal(|ui| {
                 ui.label("Substeps");
                 changed |= ui.add(egui::DragValue::new(&mut st.substeps).range(1..=64)).changed();
@@ -1192,4 +1324,13 @@ fn tool_settings(app: &mut App, ui: &mut egui::Ui) {
             _ => "—",
         });
     });
+}
+
+/// One labelled drag-value row; true when changed.
+fn ae_row(ui: &mut egui::Ui, label: &str, v: &mut f32, speed: f64, lo: f32, hi: f32) -> bool {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::DragValue::new(v).speed(speed).range(lo..=hi)).changed()
+    })
+    .inner
 }

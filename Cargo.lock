@@ -3258,6 +3258,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "flate2",
  "glam",
  "image",
  "openusd",

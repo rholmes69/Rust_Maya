@@ -3,6 +3,12 @@
 //! transparency / file textures), next-event estimation for directional, point and spot
 //! lights, an ambient/sky environment, Russian roulette and progressive multi-threaded
 //! accumulation.
+//!
+//! Motion blur: the scene can carry triangle positions at shutter open and close; every
+//! camera sample picks a time in the shutter and intersects the interpolated triangles (the
+//! BVH bounds both ends), and a moving camera is interpolated the same way.
+//! Light-path passes: each sample's radiance is split into direct diffuse, indirect diffuse,
+//! specular (direct + indirect) and emission (incl. visible sky), which add up to the beauty.
 
 use crate::render::FrameGeometry;
 use crate::texture::{TEX_SIZE, TexImage};
@@ -15,7 +21,7 @@ const EPS: f32 = 1e-4;
 
 // ------------------------------------------------------------------------------ settings
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ToneMap {
     /// Clamp + sRGB gamma (matches the viewport).
     Srgb,
@@ -23,7 +29,8 @@ pub enum ToneMap {
     Filmic,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RenderSettings {
     pub width: u32,
     pub height: u32,
@@ -44,11 +51,15 @@ pub struct RenderSettings {
     pub denoise: bool,
     /// Render region (x0, y0, x1, y1 in 0..1, top-left origin); None = whole frame.
     pub region: Option<[f32; 4]>,
+    /// Motion blur, with the shutter open for this fraction of a frame (centred on it;
+    /// 0.5 = a 180° shutter).
+    pub motion_blur: bool,
+    pub shutter: f32,
 }
 
 impl Default for RenderSettings {
     fn default() -> Self {
-        RenderSettings { width: 960, height: 540, spp: 64, bounces: 4, env: 0.25, exposure: 0.0, tonemap: ToneMap::Srgb, env_background: false, clamp: 4.0, denoise: true, region: None }
+        RenderSettings { width: 960, height: 540, spp: 64, bounces: 4, env: 0.25, exposure: 0.0, tonemap: ToneMap::Srgb, env_background: false, clamp: 4.0, denoise: true, region: None, motion_blur: false, shutter: 0.5 }
     }
 }
 
@@ -58,6 +69,7 @@ impl RenderSettings {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (self.width, self.height, self.spp, self.bounces, self.env.to_bits(), self.env_background, self.clamp.to_bits()).hash(&mut h);
         self.region.map(|r| r.map(f32::to_bits)).hash(&mut h);
+        (self.motion_blur, self.shutter.to_bits()).hash(&mut h);
         h.finish()
     }
 }
@@ -77,9 +89,34 @@ pub struct RtCamera {
     /// Thin-lens aperture radius (0 = pinhole) and focus distance.
     pub lens_radius: f32,
     pub focus: f32,
+    /// Eye / forward / right / up at shutter close (the fields above are shutter open).
+    pub motion: Option<(Vec3, Vec3, Vec3, Vec3)>,
 }
 
 impl RtCamera {
+    /// The same camera, moving to `end` over the shutter.
+    pub fn with_motion(mut self, end: &RtCamera) -> RtCamera {
+        if end.eye.distance(self.eye) > 1e-7 || end.fwd.distance(self.fwd) > 1e-7 || end.up.distance(self.up) > 1e-7 {
+            self.motion = Some((end.eye, end.fwd, end.right, end.up));
+        }
+        self
+    }
+
+    /// The camera at shutter time `t` (0..1).
+    fn at(&self, t: f32) -> RtCamera {
+        match self.motion {
+            Some((e, f, r, u)) => RtCamera {
+                eye: self.eye.lerp(e, t),
+                fwd: self.fwd.lerp(f, t).normalize_or(self.fwd),
+                right: self.right.lerp(r, t).normalize_or(self.right),
+                up: self.up.lerp(u, t).normalize_or(self.up),
+                motion: None,
+                ..*self
+            },
+            None => *self,
+        }
+    }
+
     pub fn from_view(c: &crate::camera::Camera) -> RtCamera {
         RtCamera {
             eye: c.eye(),
@@ -90,6 +127,7 @@ impl RtCamera {
             ortho_half: c.is_ortho().then_some(c.ortho_half),
             lens_radius: 0.0,
             focus: 1.0,
+            motion: None,
         }
     }
 
@@ -103,7 +141,7 @@ impl RtCamera {
         let up = right.cross(fwd).normalize();
         // Focal length in mm, scene unit = 1 m: aperture radius = f / (2 N).
         let lens_radius = if cs.dof { cs.focal * 0.001 / (2.0 * cs.fstop.max(0.5)) * cs.blur_scale } else { 0.0 };
-        RtCamera { eye, fwd, right, up, tan_half: (fov_y_deg.to_radians() * 0.5).tan(), ortho_half: None, lens_radius, focus: cs.focus_distance.max(1e-3) }
+        RtCamera { eye, fwd, right, up, tan_half: (fov_y_deg.to_radians() * 0.5).tan(), ortho_half: None, lens_radius, focus: cs.focus_distance.max(1e-3), motion: None }
     }
 
     pub fn key(&self) -> u64 {
@@ -113,6 +151,7 @@ impl RtCamera {
             v.to_array().map(f32::to_bits).hash(&mut h);
         }
         (self.tan_half.to_bits(), self.ortho_half.map(f32::to_bits), self.lens_radius.to_bits(), self.focus.to_bits()).hash(&mut h);
+        self.motion.map(|(a, b, c, d)| [a, b, c, d].map(|v| v.to_array().map(f32::to_bits))).hash(&mut h);
         h.finish()
     }
 
@@ -203,6 +242,10 @@ struct BvhNode {
 
 pub struct RtScene {
     tris: Vec<Tri>,
+    /// Triangles at shutter close (empty = nothing moves).
+    tris1: Vec<Tri>,
+    /// Shading normals at shutter close (parallel to `tris1`).
+    n1: Vec<[Vec3; 3]>,
     shade: Vec<TriShade>,
     mats: Vec<RtMaterial>,
     nodes: Vec<BvhNode>,
@@ -223,17 +266,46 @@ impl RtScene {
     /// Build from the viewport's world-space geometry (shaded triangles of visible meshes)
     /// and lights. `cam` positions the default key light when the scene has no lights.
     pub fn build(g: &FrameGeometry, cam: &RtCamera) -> RtScene {
+        Self::build_motion(g, None, cam)
+    }
+
+    /// Build with geometry at shutter open (`g`) and, for motion blur, at shutter close (`g1`).
+    /// Chunks whose triangle count changed between the two (e.g. particles being born) don't
+    /// blur.
+    pub fn build_motion(g: &FrameGeometry, g1: Option<&FrameGeometry>, cam: &RtCamera) -> RtScene {
         let mut tris = Vec::new();
+        let mut tris1 = Vec::new();
+        let mut n1 = Vec::new();
         let mut shade = Vec::new();
         let mut mats: Vec<RtMaterial> = Vec::new();
         let mut mat_ids: std::collections::HashMap<[u32; 15], u32> = Default::default();
+        let ends: Vec<&std::sync::Arc<crate::render::Chunk>> = match g1 {
+            Some(g1) if g1.tris.len() == g.tris.len() && g1.tris_transp.len() == g.tris_transp.len() => g1.tris.iter().chain(&g1.tris_transp).collect(),
+            _ => Vec::new(),
+        };
+        let mut moving = false;
         for (ci, chunk) in g.tris.iter().chain(&g.tris_transp).enumerate() {
-            for t in chunk.data.chunks_exact(3) {
+            let end = ends.get(ci).filter(|e| e.data.len() == chunk.data.len()).map(|e| &e.data);
+            for (k, t) in chunk.data.chunks_exact(3).enumerate() {
                 let (a, b, c) = (Vec3::from(t[0].pos), Vec3::from(t[1].pos), Vec3::from(t[2].pos));
                 let e1 = b - a;
                 let e2 = c - a;
-                if e1.cross(e2).length_squared() < 1e-20 {
+                let t1 = end.map(|d| &d[k * 3..k * 3 + 3]);
+                let deg0 = e1.cross(e2).length_squared() < 1e-20;
+                let deg1 = t1.is_none_or(|t1| (Vec3::from(t1[1].pos) - Vec3::from(t1[0].pos)).cross(Vec3::from(t1[2].pos) - Vec3::from(t1[0].pos)).length_squared() < 1e-20);
+                if deg0 && deg1 {
                     continue;
+                }
+                {
+                    let t1 = t1.unwrap_or(t);
+                    let (a1, b1, c1) = (Vec3::from(t1[0].pos), Vec3::from(t1[1].pos), Vec3::from(t1[2].pos));
+                    if a1 != a || b1 != b || c1 != c {
+                        moving = true;
+                    }
+                    tris1.push(Tri { v0: a1, e1: b1 - a1, e2: c1 - a1 });
+                    let fb = (b1 - a1).cross(c1 - a1).normalize_or(Vec3::Y);
+                    let nn = |i: usize| Vec3::from(t1[i].nrm).try_normalize().unwrap_or(fb);
+                    n1.push([nn(0), nn(1), nn(2)]);
                 }
                 let v = &t[0];
                 let key = [
@@ -270,7 +342,7 @@ impl RtScene {
                     });
                     mats.len() as u32 - 1
                 });
-                let fallback = e1.cross(e2).normalize();
+                let fallback = e1.cross(e2).normalize_or(Vec3::Y);
                 let n = |i: usize| Vec3::from(t[i].nrm).try_normalize().unwrap_or(fallback);
                 tris.push(Tri { v0: a, e1, e2 });
                 let (uv0, uv1, uv2) = (Vec2::from(t[0].uv), Vec2::from(t[1].uv), Vec2::from(t[2].uv));
@@ -328,7 +400,11 @@ impl RtScene {
         }
         let textures = g.textures.as_ref().map(|t| t.layers.clone()).unwrap_or_default();
         let tri_count = tris.len();
-        let mut s = RtScene { tris, shade, mats, nodes: Vec::new(), lights, ambient, textures, default_light, tri_count };
+        if !moving {
+            tris1.clear();
+            n1.clear();
+        }
+        let mut s = RtScene { tris, tris1, n1, shade, mats, nodes: Vec::new(), lights, ambient, textures, default_light, tri_count };
         s.build_bvh();
         s
     }
@@ -340,12 +416,20 @@ impl RtScene {
         if n == 0 {
             return;
         }
-        let bounds: Vec<(Vec3, Vec3)> = self
-            .tris
-            .iter()
-            .map(|t| {
-                let (b, c) = (t.v0 + t.e1, t.v0 + t.e2);
-                (t.v0.min(b).min(c), t.v0.max(b).max(c))
+        let tb = |t: &Tri| {
+            let (b, c) = (t.v0 + t.e1, t.v0 + t.e2);
+            (t.v0.min(b).min(c), t.v0.max(b).max(c))
+        };
+        let bounds: Vec<(Vec3, Vec3)> = (0..n)
+            .map(|i| {
+                let (lo, hi) = tb(&self.tris[i]);
+                match self.tris1.get(i) {
+                    Some(t1) => {
+                        let (lo1, hi1) = tb(t1);
+                        (lo.min(lo1), hi.max(hi1))
+                    }
+                    None => (lo, hi),
+                }
             })
             .collect();
         let cent: Vec<Vec3> = bounds.iter().map(|(a, b)| (*a + *b) * 0.5).collect();
@@ -444,12 +528,30 @@ impl RtScene {
         }
         // Reorder triangles so leaves are contiguous.
         self.tris = idx.iter().map(|i| self.tris[*i as usize]).collect();
+        if !self.tris1.is_empty() {
+            self.tris1 = idx.iter().map(|i| self.tris1[*i as usize]).collect();
+            self.n1 = idx.iter().map(|i| self.n1[*i as usize]).collect();
+        }
         self.shade = idx.iter().map(|i| self.shade[*i as usize]).collect();
         self.nodes = nodes;
     }
 
+    /// Does the scene move during the shutter?
+    pub fn is_moving(&self) -> bool {
+        !self.tris1.is_empty()
+    }
+
+    /// Triangle `i` at shutter time `time` (0..1).
+    fn tri_at(&self, i: usize, time: f32) -> Tri {
+        let t = self.tris[i];
+        match self.tris1.get(i) {
+            Some(t1) if time > 0.0 => Tri { v0: t.v0.lerp(t1.v0, time), e1: t.e1.lerp(t1.e1, time), e2: t.e2.lerp(t1.e2, time) },
+            _ => t,
+        }
+    }
+
     /// Closest hit: (t, triangle, u, v).
-    fn intersect(&self, o: Vec3, d: Vec3, tmax: f32) -> Option<(f32, usize, f32, f32)> {
+    fn intersect(&self, o: Vec3, d: Vec3, tmax: f32, time: f32) -> Option<(f32, usize, f32, f32)> {
         if self.nodes.is_empty() {
             return None;
         }
@@ -466,7 +568,8 @@ impl RtScene {
             }
             if node.count > 0 {
                 for i in node.start as usize..(node.start + node.count) as usize {
-                    if let Some((t, u, v)) = tri_hit(&self.tris[i], o, d, tbest) {
+                    let tri = if self.tris1.is_empty() { self.tris[i] } else { self.tri_at(i, time) };
+                    if let Some((t, u, v)) = tri_hit(&tri, o, d, tbest) {
                         tbest = t;
                         best = Some((t, i, u, v));
                     }
@@ -492,10 +595,10 @@ impl RtScene {
     }
 
     /// Transmission along a shadow ray (1 = unblocked; transparent surfaces let light through).
-    fn transmission(&self, mut o: Vec3, d: Vec3, mut dist: f32) -> f32 {
+    fn transmission(&self, mut o: Vec3, d: Vec3, mut dist: f32, time: f32) -> f32 {
         let mut tr = 1.0;
         for _ in 0..8 {
-            let Some((t, i, _, _)) = self.intersect(o, d, dist) else { return tr };
+            let Some((t, i, _, _)) = self.intersect(o, d, dist, time) else { return tr };
             let m = &self.mats[self.shade[i].mat as usize];
             tr *= m.transp;
             if tr < 1e-3 {
@@ -650,32 +753,40 @@ fn fresnel(f0: Vec3, c: f32) -> Vec3 {
 }
 
 impl Surface {
-    /// BSDF value times cos(wi), and the sampling pdf for wi.
-    fn eval(&self, wo: Vec3, wi: Vec3) -> (Vec3, f32) {
+    /// Diffuse and specular BSDF values times cos(wi), and each lobe's own pdf for wi.
+    fn eval_split(&self, wo: Vec3, wi: Vec3) -> (Vec3, Vec3, f32, f32) {
         let nwi = self.n.dot(wi);
         let nwo = self.n.dot(wo);
         if nwi <= 0.0 || nwo <= 0.0 {
-            return (Vec3::ZERO, 0.0);
+            return (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0);
         }
         let diff = self.kd * (1.0 / PI) * nwi;
         let pdf_d = nwi / PI;
-        let mut f = diff;
-        let mut pdf = (1.0 - self.p_spec) * pdf_d;
-        if self.p_spec > 0.0 {
-            let h = (wi + wo).normalize();
-            let nh = self.n.dot(h).max(0.0);
-            let vh = wo.dot(h).max(1e-6);
-            let a2 = self.alpha * self.alpha;
-            let d = ggx_d(nh, a2);
-            let g = smith_g1(nwo, a2) * smith_g1(nwi, a2);
-            let fr = fresnel(self.f0, vh);
-            f += fr * (d * g / (4.0 * nwo));
-            pdf += self.p_spec * d * nh / (4.0 * vh);
+        if self.p_spec <= 0.0 {
+            return (diff, Vec3::ZERO, pdf_d, 0.0);
         }
-        (f, pdf)
+        let h = (wi + wo).normalize();
+        let nh = self.n.dot(h).max(0.0);
+        let vh = wo.dot(h).max(1e-6);
+        let a2 = self.alpha * self.alpha;
+        let d = ggx_d(nh, a2);
+        let g = smith_g1(nwo, a2) * smith_g1(nwi, a2);
+        let fr = fresnel(self.f0, vh);
+        (diff, fr * (d * g / (4.0 * nwo)), pdf_d, d * nh / (4.0 * vh))
     }
 
+    /// BSDF value times cos(wi), and the (mixture) sampling pdf for wi.
+    fn eval(&self, wo: Vec3, wi: Vec3) -> (Vec3, f32) {
+        let (fd, fs, pd, ps) = self.eval_split(wo, wi);
+        (fd + fs, (1.0 - self.p_spec) * pd + self.p_spec * ps)
+    }
+
+    /// Sample a direction; also says whether the specular lobe was chosen.
     fn sample(&self, wo: Vec3, rng: &mut Rng) -> Option<Vec3> {
+        self.sample_lobe(wo, rng).map(|x| x.0)
+    }
+
+    fn sample_lobe(&self, wo: Vec3, rng: &mut Rng) -> Option<(Vec3, bool)> {
         let (t, b) = basis(self.n);
         let (u1, u2) = (rng.f(), rng.f());
         if rng.f() < self.p_spec {
@@ -685,11 +796,11 @@ impl Surface {
             let phi = 2.0 * PI * u2;
             let h = t * (sin_t * phi.cos()) + b * (sin_t * phi.sin()) + self.n * cos_t;
             let wi = 2.0 * wo.dot(h) * h - wo;
-            (wi.dot(self.n) > 0.0).then_some(wi)
+            (wi.dot(self.n) > 0.0).then_some((wi, true))
         } else {
             let r = u1.sqrt();
             let phi = 2.0 * PI * u2;
-            Some((t * (r * phi.cos()) + b * (r * phi.sin()) + self.n * (1.0 - u1).max(0.0).sqrt()).normalize())
+            Some(((t * (r * phi.cos()) + b * (r * phi.sin()) + self.n * (1.0 - u1).max(0.0).sqrt()).normalize(), false))
         }
     }
 }
@@ -706,10 +817,42 @@ struct Aov {
     obj: u32,
 }
 
-/// One path sample: (radiance, alpha coverage, first-hit albedo / normal).
-fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut Rng) -> (Vec3, f32, Aov) {
+/// A sample's radiance split by light path. The four add up to the beauty.
+#[derive(Clone, Copy, Default)]
+struct Lobes {
+    diffuse_direct: Vec3,
+    diffuse_indirect: Vec3,
+    specular: Vec3,
+    emission: Vec3,
+}
+
+impl Lobes {
+    fn total(&self) -> Vec3 {
+        self.diffuse_direct + self.diffuse_indirect + self.specular + self.emission
+    }
+}
+
+/// Path category for the light-path passes: before the first opaque hit, through the
+/// diffuse lobe there, or through the specular lobe.
+#[derive(Clone, Copy, PartialEq)]
+enum PathCat {
+    Camera,
+    Diffuse,
+    Specular,
+}
+
+/// One path sample at shutter time `time`: (radiance by light path, alpha coverage, first-hit
+/// features).
+fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut Rng, time: f32) -> (Lobes, f32, Aov) {
     let mut aov = Aov::default();
-    let mut l = Vec3::ZERO;
+    let mut lobes = Lobes::default();
+    let mut cat = PathCat::Camera;
+    // Indirect light goes to the category of the path's first bounce.
+    let add = |lobes: &mut Lobes, cat: PathCat, c: Vec3| match cat {
+        PathCat::Camera => lobes.emission += c,
+        PathCat::Diffuse => lobes.diffuse_indirect += c,
+        PathCat::Specular => lobes.specular += c,
+    };
     let mut thr = Vec3::ONE;
     let mut alpha = 0.0;
     let mut depth = 0u32;
@@ -717,11 +860,11 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
     let mut primary = true;
     let mut dist_acc = 0.0f32;
     loop {
-        let Some((t, ti, u, v)) = sc.intersect(o, d, f32::MAX) else {
+        let Some((t, ti, u, v)) = sc.intersect(o, d, f32::MAX, time) else {
             if primary {
                 if s.env_background {
                     let c = sc.sky(d, s.env);
-                    l += c;
+                    lobes.emission += c;
                     alpha = 1.0;
                     aov.albedo = c.min(Vec3::ONE);
                 }
@@ -733,7 +876,7 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
                         c *= s.clamp / m;
                     }
                 }
-                l += c;
+                add(&mut lobes, cat, c);
             }
             break;
         };
@@ -744,9 +887,13 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
         let mut m = sc.mats[sh.mat as usize];
         let p = o + d * t;
         let w = 1.0 - u - v;
-        let tri = &sc.tris[ti];
-        let mut ng = tri.e1.cross(tri.e2).normalize();
-        let mut n = (sh.n[0] * w + sh.n[1] * u + sh.n[2] * v).normalize_or(ng);
+        let tri = sc.tri_at(ti, time);
+        let mut ng = tri.e1.cross(tri.e2).normalize_or(Vec3::Y);
+        let sn = match sc.n1.get(ti) {
+            Some(n1) if time > 0.0 => [sh.n[0].lerp(n1[0], time), sh.n[1].lerp(n1[1], time), sh.n[2].lerp(n1[2], time)],
+            _ => sh.n,
+        };
+        let mut n = (sn[0] * w + sn[1] * u + sn[2] * v).normalize_or(ng);
         if ng.dot(d) > 0.0 {
             ng = -ng;
         }
@@ -814,7 +961,7 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
         }
         primary = false;
         if m.emission.max_element() > 0.0 {
-            l += thr * m.emission;
+            add(&mut lobes, cat, thr * m.emission);
         }
         let f0 = Vec3::splat(0.08 * m.spec).lerp(base, m.metal);
         let kd = base * (1.0 - m.metal) * (1.0 - f0.max_element().min(0.9));
@@ -859,24 +1006,50 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
             if rad.max_element() <= 0.0 || wi.dot(ng) <= 0.0 {
                 continue;
             }
-            let (f, _) = surf.eval(wo, wi);
-            if f.max_element() <= 0.0 {
+            let (fd, fs, _, _) = surf.eval_split(wo, wi);
+            if (fd + fs).max_element() <= 0.0 {
                 continue;
             }
-            let tr = sc.transmission(po, wi, dist);
+            let tr = sc.transmission(po, wi, dist, time);
             if tr > 0.0 {
-                let mut c = thr * f * rad * tr;
+                let k = thr * rad * tr;
+                let (mut cd, mut cs) = (k * fd, k * fs);
                 if depth > 0 {
-                    let mx = c.max_element();
+                    let mx = (cd + cs).max_element();
                     if mx > s.clamp {
-                        c *= s.clamp / mx;
+                        cd *= s.clamp / mx;
+                        cs *= s.clamp / mx;
                     }
                 }
-                l += c;
+                if cat == PathCat::Camera {
+                    lobes.diffuse_direct += cd;
+                    lobes.specular += cs;
+                } else {
+                    add(&mut lobes, cat, cd + cs);
+                }
             }
         }
         if depth >= s.bounces {
             break;
+        }
+        if cat == PathCat::Camera {
+            // First bounce: pick one lobe and weight by it alone, so each light-path pass is
+            // estimated on its own.
+            let Some((wi, spec)) = surf.sample_lobe(wo, rng) else { break };
+            let (fd, fs, pd, ps) = surf.eval_split(wo, wi);
+            let (f, pdf) = if spec { (fs, surf.p_spec * ps) } else { (fd, (1.0 - surf.p_spec) * pd) };
+            if pdf <= 1e-8 || wi.dot(ng) <= 0.0 {
+                break;
+            }
+            thr *= f / pdf * ao;
+            cat = if spec { PathCat::Specular } else { PathCat::Diffuse };
+            depth += 1;
+            if !thr.is_finite() {
+                break;
+            }
+            o = po;
+            d = wi;
+            continue;
         }
         let Some(wi) = surf.sample(wo, rng) else { break };
         let (f, pdf) = surf.eval(wo, wi);
@@ -899,7 +1072,7 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
         o = po;
         d = wi;
     }
-    (l, alpha, aov)
+    (lobes, alpha, aov)
 }
 
 // ------------------------------------------------------------------------------ jobs
@@ -910,6 +1083,9 @@ struct Buffers {
     /// Accumulated first-hit albedo (3), normal (3), luminance² (1), gloss (1); then depth
     /// and object id from the first (unjittered) pass.
     aov: Vec<[f32; 10]>,
+    /// Accumulated light-path radiance: diffuse direct, diffuse indirect, specular, emission
+    /// (RGB each).
+    lobes: Vec<[f32; 12]>,
     /// Samples accumulated per row.
     row_spp: Vec<u32>,
 }
@@ -939,10 +1115,53 @@ pub enum Pass {
     Normal,
     Depth,
     ObjectId,
+    /// Light-path passes: these four add up to the (undenoised) beauty.
+    DiffuseDirect,
+    DiffuseIndirect,
+    Specular,
+    Emission,
 }
 
 impl Pass {
-    pub const ALL: [Pass; 5] = [Pass::Beauty, Pass::Albedo, Pass::Normal, Pass::Depth, Pass::ObjectId];
+    pub const ALL: [Pass; 9] = [
+        Pass::Beauty,
+        Pass::Albedo,
+        Pass::Normal,
+        Pass::Depth,
+        Pass::ObjectId,
+        Pass::DiffuseDirect,
+        Pass::DiffuseIndirect,
+        Pass::Specular,
+        Pass::Emission,
+    ];
+    /// Index into the light-path accumulation buffer.
+    fn lobe(self) -> Option<usize> {
+        match self {
+            Pass::DiffuseDirect => Some(0),
+            Pass::DiffuseIndirect => Some(3),
+            Pass::Specular => Some(6),
+            Pass::Emission => Some(9),
+            _ => None,
+        }
+    }
+    /// File-name suffix (`shot_diffuse_direct.png`).
+    pub fn file_tag(self) -> &'static str {
+        match self {
+            Pass::Beauty => "beauty",
+            Pass::Albedo => "albedo",
+            Pass::Normal => "normal",
+            Pass::Depth => "depth",
+            Pass::ObjectId => "objectid",
+            Pass::DiffuseDirect => "diffuse_direct",
+            Pass::DiffuseIndirect => "diffuse_indirect",
+            Pass::Specular => "specular",
+            Pass::Emission => "emission",
+        }
+    }
+    pub fn from_name(s: &str) -> Option<Pass> {
+        let k: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+        Pass::ALL.into_iter().find(|p| p.file_tag().replace('_', "") == k || p.name().replace(' ', "").to_lowercase() == k)
+    }
     pub fn name(self) -> &'static str {
         match self {
             Pass::Beauty => "Beauty",
@@ -950,6 +1169,10 @@ impl Pass {
             Pass::Normal => "Normal",
             Pass::Depth => "Depth",
             Pass::ObjectId => "Object ID",
+            Pass::DiffuseDirect => "Diffuse Direct",
+            Pass::DiffuseIndirect => "Diffuse Indirect",
+            Pass::Specular => "Specular",
+            Pass::Emission => "Emission",
         }
     }
 }
@@ -990,7 +1213,7 @@ impl RenderJob {
             h,
             region,
             base,
-            buf: Mutex::new(Buffers { accum: vec![[0.0; 4]; (w * h) as usize], aov: vec![[0.0; 10]; (w * h) as usize], row_spp: vec![0; h as usize] }),
+            buf: Mutex::new(Buffers { accum: vec![[0.0; 4]; (w * h) as usize], aov: vec![[0.0; 10]; (w * h) as usize], lobes: vec![[0.0; 12]; (w * h) as usize], row_spp: vec![0; h as usize] }),
             cancel: AtomicBool::new(false),
             rows_done: AtomicU64::new(0),
             version: AtomicU64::new(0),
@@ -1133,6 +1356,9 @@ impl RenderJob {
         if pass == Pass::Beauty {
             return self.rgba8(exposure, tm);
         }
+        if pass.lobe().is_some() {
+            return tonemap(&self.pass_linear(pass), exposure, tm);
+        }
         let b = self.shared.buf.lock().unwrap();
         let wu = self.shared.w as usize;
         let enc = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0 + 0.5) as u8;
@@ -1182,16 +1408,59 @@ impl RenderJob {
                         [c(0), c(8), c(16), 255]
                     }
                 }
-                Pass::Beauty => unreachable!(),
+                _ => unreachable!(),
             };
             out.extend_from_slice(&px);
         }
         out
     }
 
-    /// Save every pass next to `path` as name_beauty.png, name_albedo.png, …
+    /// A pass as linear float RGBA (rows top to bottom), for EXR output: colour passes in
+    /// linear light (beauty denoised as configured), normals in -1..1, depth as camera
+    /// distance (0 = no hit), object ids as plain numbers. Alpha is coverage.
+    pub fn pass_linear(&self, pass: Pass) -> Vec<[f32; 4]> {
+        if pass == Pass::Beauty {
+            return self.final_linear();
+        }
+        let b = self.shared.buf.lock().unwrap();
+        let wu = self.shared.w as usize;
+        b.aov
+            .iter()
+            .zip(&b.accum)
+            .zip(&b.lobes)
+            .enumerate()
+            .map(|(i, ((a, p), l))| {
+                if !self.in_region(i) || b.row_spp[i / wu] == 0 {
+                    return [0.0; 4];
+                }
+                let n = b.row_spp[i / wu] as f32;
+                let cov = (p[3] / n).clamp(0.0, 1.0);
+                match pass {
+                    Pass::Albedo => [a[0] / n, a[1] / n, a[2] / n, cov],
+                    Pass::Normal => {
+                        let v = Vec3::new(a[3], a[4], a[5]).normalize_or_zero();
+                        [v.x, v.y, v.z, if v == Vec3::ZERO { 0.0 } else { 1.0 }]
+                    }
+                    Pass::Depth => [a[8], a[8], a[8], if a[8] > 0.0 { 1.0 } else { 0.0 }],
+                    Pass::ObjectId => [a[9], a[9], a[9], if a[9] > 0.0 { 1.0 } else { 0.0 }],
+                    _ => {
+                        let k = pass.lobe().unwrap_or(0);
+                        [l[k] / n, l[k + 1] / n, l[k + 2] / n, cov]
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Save every pass next to `path` as name_beauty.png, name_albedo.png, … — or, when
+    /// `path` ends in .exr, as linear 32-bit float EXRs (name_beauty.exr, …).
     pub fn save_passes(&self, path: &std::path::Path, exposure: f32, tm: ToneMap) -> Result<Vec<String>, String> {
-        let (w, h) = self.size();
+        self.save_pass_list(path, &Pass::ALL, exposure, tm)
+    }
+
+    /// Save the given passes (see [`RenderJob::save_passes`]).
+    pub fn save_pass_list(&self, path: &std::path::Path, passes: &[Pass], exposure: f32, tm: ToneMap) -> Result<Vec<String>, String> {
+        let exr = is_exr(path);
         let stem = path.with_extension("");
         let mut out = Vec::new();
         if let Some(dir) = path.parent()
@@ -1199,13 +1468,28 @@ impl RenderJob {
         {
             let _ = std::fs::create_dir_all(dir);
         }
-        for p in Pass::ALL {
-            let file = format!("{}_{}.png", stem.display(), p.name().to_lowercase().replace(' ', ""));
-            let img = image::RgbaImage::from_raw(w, h, self.pass_rgba8(p, exposure, tm)).ok_or("image size")?;
-            img.save(&file).map_err(|e| format!("{file}: {e}"))?;
+        for &p in passes {
+            let file = format!("{}_{}.{}", stem.display(), p.file_tag(), if exr { "exr" } else { "png" });
+            self.save_pass(p, std::path::Path::new(&file), exposure, tm)?;
             out.push(file);
         }
         Ok(out)
+    }
+
+    /// Save one pass to `file` (linear float for .exr, else 8-bit).
+    pub fn save_pass(&self, p: Pass, file: &std::path::Path, exposure: f32, tm: ToneMap) -> Result<(), String> {
+        let (w, h) = self.size();
+        if let Some(dir) = file.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if is_exr(file) {
+            save_exr(file, w, h, &self.pass_linear(p))
+        } else {
+            let img = image::RgbaImage::from_raw(w, h, self.pass_rgba8(p, exposure, tm)).ok_or("image size")?;
+            img.save(file).map_err(|e| format!("{}: {e}", file.display()))
+        }
     }
 
     /// Tone-mapped sRGB RGBA8 (rows top to bottom). Rows without samples are transparent.
@@ -1213,8 +1497,20 @@ impl RenderJob {
         tonemap(&self.final_linear(), exposure, tm)
     }
 
+    /// Save the beauty: tone-mapped 8-bit for PNG/JPEG/…, linear float for .exr.
     pub fn save_png(&self, path: &std::path::Path, exposure: f32, tm: ToneMap) -> Result<(), String> {
         let (w, h) = self.size();
+        if is_exr(path) {
+            if let Some(dir) = path.parent()
+                && !dir.as_os_str().is_empty()
+            {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // Exposure applies to the stored values; tone mapping does not (EXR stays linear).
+            let k = 2f32.powf(exposure);
+            let px: Vec<[f32; 4]> = self.final_linear().into_iter().map(|p| [p[0] * k, p[1] * k, p[2] * k, p[3]]).collect();
+            return save_exr(path, w, h, &px);
+        }
         let img = image::RgbaImage::from_raw(w, h, self.rgba8(exposure, tm)).ok_or("image size")?;
         if let Some(dir) = path.parent()
             && !dir.as_os_str().is_empty()
@@ -1367,6 +1663,7 @@ fn worker(sh: &Shared, sc: &RtScene, cam: &RtCamera, s: &RenderSettings, wi: u32
     let aspect = w as f32 / h as f32;
     let mut row = vec![[0.0f32; 4]; w as usize];
     let mut row_aov = vec![[0.0f32; 10]; w as usize];
+    let mut row_lobes = vec![[0.0f32; 12]; w as usize];
     for pass in 0..s.spp.max(1) {
         let mut y = ry0 + wi;
         while y < ry1.min(h) {
@@ -1379,9 +1676,19 @@ fn worker(sh: &Shared, sc: &RtScene, cam: &RtCamera, s: &RenderSettings, wi: u32
                 let sx = ((x as f32 + jx) / w as f32) * 2.0 - 1.0;
                 let sy = 1.0 - ((y as f32 + jy) / h as f32) * 2.0;
                 let lens = if pass == 0 { (0.0, 0.0) } else { (rng.f(), rng.f()) };
-                let (o, d) = cam.ray(sx, sy, aspect, lens);
-                let (c, a, aov) = trace(sc, s, o, d, &mut rng);
-                let c = if c.is_finite() { c } else { Vec3::ZERO };
+                // Shutter time 0..1 (open to close); the unjittered pass sits mid-shutter.
+                let time = if !sc.is_moving() && cam.motion.is_none() { 0.0 } else if pass == 0 { 0.5 } else { rng.f() };
+                let (o, d) = cam.at(time).ray(sx, sy, aspect, lens);
+                let (lb, a, aov) = trace(sc, s, o, d, &mut rng, time);
+                let c = lb.total();
+                let ok = c.is_finite();
+                let c = if ok { c } else { Vec3::ZERO };
+                row_lobes[x as usize] = if ok {
+                    let (p, q, r, e) = (lb.diffuse_direct, lb.diffuse_indirect, lb.specular, lb.emission);
+                    [p.x, p.y, p.z, q.x, q.y, q.z, r.x, r.y, r.z, e.x, e.y, e.z]
+                } else {
+                    [0.0; 12]
+                };
                 row[x as usize] = [c.x, c.y, c.z, a];
                 let lm = lum(c);
                 row_aov[x as usize] = [aov.albedo.x, aov.albedo.y, aov.albedo.z, aov.normal.x, aov.normal.y, aov.normal.z, lm * lm, aov.gloss, aov.depth, aov.obj as f32];
@@ -1403,6 +1710,11 @@ fn worker(sh: &Shared, sc: &RtScene, cam: &RtCamera, s: &RenderSettings, wi: u32
                         dst[9] = src[9];
                     }
                 }
+                for (dst, src) in b.lobes[base..base + w as usize].iter_mut().zip(&row_lobes).skip(x0).take(x1 - x0) {
+                    for k in 0..12 {
+                        dst[k] += src[k];
+                    }
+                }
                 b.row_spp[y as usize] += 1;
             }
             sh.rows_done.fetch_add(1, Ordering::Relaxed);
@@ -1410,6 +1722,17 @@ fn worker(sh: &Shared, sc: &RtScene, cam: &RtCamera, s: &RenderSettings, wi: u32
             y += n;
         }
     }
+}
+
+fn is_exr(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("exr"))
+}
+
+/// Write linear float RGBA as an OpenEXR file.
+pub fn save_exr(path: &std::path::Path, w: u32, h: u32, px: &[[f32; 4]]) -> Result<(), String> {
+    let flat: Vec<f32> = px.iter().flat_map(|p| p.iter().copied()).collect();
+    let img = image::Rgba32FImage::from_raw(w, h, flat).ok_or("image size")?;
+    image::DynamicImage::ImageRgba32F(img).save(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Render synchronously (batch / MEL `render -o`).
@@ -1441,7 +1764,7 @@ mod tests {
         for _ in 0..300 {
             let o = Vec3::new(rng.f() * 8.0 - 4.0, rng.f() * 8.0 - 4.0, 6.0);
             let d = (Vec3::new(rng.f() * 2.0 - 1.0, rng.f() * 2.0 - 1.0, 0.0) - o).normalize();
-            let fast = sc.intersect(o, d, f32::MAX).map(|h| h.0);
+            let fast = sc.intersect(o, d, f32::MAX, 0.0).map(|h| h.0);
             let slow = sc.tris.iter().filter_map(|t| tri_hit(t, o, d, f32::MAX).map(|h| h.0)).fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.min(t))));
             match (fast, slow) {
                 (Some(a), Some(b)) => assert!((a - b).abs() < 1e-4),
@@ -1721,7 +2044,7 @@ mod pass_tests {
         // Passes on disk.
         let dir = std::env::temp_dir().join("rm_passes");
         let files = job.save_passes(&dir.join("shot.png"), 0.0, ToneMap::Srgb).unwrap();
-        assert_eq!(files.len(), 5);
+        assert_eq!(files.len(), Pass::ALL.len());
         assert!(files.iter().all(|f| std::path::Path::new(f).exists()));
         // Region: only the region is re-rendered; outside comes from the base image.
         let base = job.final_linear();
@@ -1755,5 +2078,78 @@ mod pass_tests {
         let e_blur = edge_energy(&blurred, fx0, fx1, fy0, fy1);
         eprintln!("far edge energy sharp {e_sharp:.3} dof {e_blur:.3}");
         assert!(e_blur < e_sharp * 0.8, "far cube is defocused");
+    }
+
+    fn coverage_stats(job: &RenderJob) -> (usize, usize) {
+        // (pixels partly covered, pixels covered at all)
+        let lin = job.linear();
+        let partial = lin.iter().filter(|p| p[3] > 0.05 && p[3] < 0.95).count();
+        let any = lin.iter().filter(|p| p[3] > 0.05).count();
+        (partial, any)
+    }
+
+    #[test]
+    fn motion_blur_smears_moving_objects_only() {
+        let mut app = App::new();
+        app.scene.nodes.clear();
+        execute(&mut app, "polySphere -r 0.6 -n ball; setKeyframe -at tx -t 1 -v -3 ball; setKeyframe -at tx -t 3 -v 3 ball; camera -n cam1 -p 0 0 8 -aim 0 0 0").unwrap();
+        app.set_time(2.0);
+        let s = RenderSettings { width: 96, height: 64, spp: 24, bounces: 1, denoise: false, ..Default::default() };
+        let sharp = app.render_now(Some("cam1"), s.clone()).unwrap();
+        let mb = RenderSettings { motion_blur: true, shutter: 0.5, ..s.clone() };
+        let blur = app.render_now(Some("cam1"), mb.clone()).unwrap();
+        let (p0, a0) = coverage_stats(&sharp);
+        let (p1, a1) = coverage_stats(&blur);
+        eprintln!("sharp partial {p0} / {a0}, blurred partial {p1} / {a1}");
+        assert!(p1 > p0 * 3, "streak has soft coverage");
+        assert!(a1 > a0 + a0 / 3, "streak covers more pixels");
+        assert_eq!(app.scene.time, 2.0, "time restored");
+        // A static scene renders identically with motion blur on.
+        execute(&mut app, "cutKey ball").unwrap();
+        app.set_time(2.0);
+        let a = app.render_now(Some("cam1"), s).unwrap().linear();
+        let b = app.render_now(Some("cam1"), mb).unwrap().linear();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn camera_motion_blurs_static_scene() {
+        let mut app = App::new();
+        app.scene.nodes.clear();
+        execute(&mut app, "polyCube -w 1 -h 1 -d 1 -n box; camera -n cam1 -p 0 0 8; setKeyframe -at ry -t 1 -v -20 cam1; setKeyframe -at ry -t 3 -v 20 cam1").unwrap();
+        app.set_time(2.0);
+        let s = RenderSettings { width: 96, height: 64, spp: 24, bounces: 1, denoise: false, ..Default::default() };
+        let (p0, _) = coverage_stats(&app.render_now(Some("cam1"), s.clone()).unwrap());
+        let (p1, _) = coverage_stats(&app.render_now(Some("cam1"), RenderSettings { motion_blur: true, shutter: 0.5, ..s }).unwrap());
+        eprintln!("camera pan: partial {p0} → {p1}");
+        assert!(p1 > p0 * 3);
+    }
+
+    #[test]
+    fn light_path_passes_sum_to_beauty() {
+        let mut app = App::new();
+        app.scene.nodes.clear();
+        execute(&mut app, "polySphere -r 1 -n a; polyCube -w 6 -h 0.2 -d 6 -n floor; move 0 -1.1 0 floor; materialPreset -p plastic -rgb 0.8 0.2 0.2 a; camera -n cam1 -p 0 1 7 -aim 0 0 0").unwrap();
+        let s = RenderSettings { width: 64, height: 48, spp: 8, bounces: 3, denoise: false, env: 0.5, env_background: true, ..Default::default() };
+        let job = app.render_now(Some("cam1"), s).unwrap();
+        let beauty = job.pass_linear(Pass::Beauty);
+        let parts: Vec<Vec<[f32; 4]>> = [Pass::DiffuseDirect, Pass::DiffuseIndirect, Pass::Specular, Pass::Emission].iter().map(|&p| job.pass_linear(p)).collect();
+        let mut tot = [0.0f64; 4];
+        for (i, b) in beauty.iter().enumerate() {
+            for k in 0..3 {
+                let sum: f32 = parts.iter().map(|p| p[i][k]).sum();
+                assert!((sum - b[k]).abs() < 1e-3 * (1.0 + b[k]), "pixel {i}: {sum} vs {}", b[k]);
+            }
+            for (j, p) in parts.iter().enumerate() {
+                tot[j] += (p[i][0] + p[i][1] + p[i][2]) as f64;
+            }
+        }
+        eprintln!("pass energy: direct {:.1} indirect {:.1} spec {:.1} emission(sky) {:.1}", tot[0], tot[1], tot[2], tot[3]);
+        assert!(tot.iter().all(|&t| t > 0.0), "every pass has some light");
+        // Names round-trip.
+        for p in Pass::ALL {
+            assert_eq!(Pass::from_name(p.file_tag()), Some(p));
+            assert_eq!(Pass::from_name(p.name()), Some(p));
+        }
     }
 }

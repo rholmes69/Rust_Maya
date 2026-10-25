@@ -352,6 +352,10 @@ pub enum Shape {
     },
     /// Particle system (emitter + simulation settings; the simulated particles are cached).
     Particles(crate::fx::Particles),
+    /// Dynamics field (air, gravity, radial, vortex, turbulence, …) placed by its transform.
+    Field(crate::fx::Field),
+    /// Hair system: dynamic strands grown from a mesh, or one dynamic curve.
+    Hair(crate::hair::Hair),
     Poly {
         /// Construction history. `None` once history is deleted or components were edited.
         history: Option<Primitive>,
@@ -526,7 +530,7 @@ impl Node {
             Shape::Locator | Shape::Curve { .. } => Some(shape_name_for(&self.name)),
             Shape::Joint { .. } => None,
             Shape::IkHandle { .. } => None,
-            Shape::ClusterHandle | Shape::Light(_) | Shape::Camera(_) | Shape::Lattice { .. } | Shape::Particles(_) => Some(format!("{}Shape", self.name)),
+            Shape::ClusterHandle | Shape::Light(_) | Shape::Camera(_) | Shape::Lattice { .. } | Shape::Particles(_) | Shape::Field(_) | Shape::Hair(_) => Some(format!("{}Shape", self.name)),
             Shape::Poly { .. } => Some(shape_name_for(&self.name)),
         }
     }
@@ -570,6 +574,11 @@ pub struct Scene {
     /// Pose library.
     #[serde(default)]
     pub poses: Vec<crate::anim_ops::Pose>,
+    /// Render settings and render camera name, saved with the scene for batch rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_settings: Option<crate::raytrace::RenderSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_camera: Option<String>,
 }
 
 impl Default for Scene {
@@ -586,6 +595,8 @@ impl Default for Scene {
             time: 1.0,
             materials: Vec::new(),
             poses: Vec::new(),
+            render_settings: None,
+            render_camera: None,
         }
     }
 }

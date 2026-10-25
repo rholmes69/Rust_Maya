@@ -1326,7 +1326,12 @@ fn pick_object(app: &App, pr: &Projector, m: Vec2) -> Option<NodeId> {
                     }
             }
             Shape::Locator | Shape::IkHandle { .. } | Shape::ClusterHandle => wire(near_poly(&[origin], false, 8.0)),
-            Shape::Particles(_) => wire(near_poly(&[origin], false, 12.0)),
+            Shape::Particles(_) | Shape::Field(_) => wire(near_poly(&[origin], false, 12.0)),
+            Shape::Hair(h) => {
+                for st in h.strands().iter().take(400) {
+                    wire(near_poly(st, false, 5.0));
+                }
+            }
             Shape::Light(_) | Shape::Camera(_) => wire(near_poly(&[origin], false, 14.0)),
             Shape::Lattice { div, points } => {
                 for (a, b) in crate::deform::lattice_lines(*div, points) {

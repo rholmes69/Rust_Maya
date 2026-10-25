@@ -29,8 +29,9 @@ Commands (MEL-style, separate with ';'):
   viewSet -persp|-top|-front|-side   viewFit [-all]   panelLayout -single|-quad
   displayMode -wire|-shaded|-wos    xray [on|off]    lighting -all|-default [-shadows on|off]
 Export:
-  file -export path.glb|path.gltf|path.usda|path.obj [-es (selected only)] [-na (no animation)] [-bp (USD: bake points instead of UsdSkel)]
-  file -import path.glb|path.gltf|path.obj [-take animName]   (glTF: hierarchy, meshes+UVs, materials+textures, skins, blend shapes, animation, lights, cameras)
+  file -export path.glb|path.gltf|path.fbx|path.usda|path.obj [-es (selected only)] [-na (no animation)] [-bp (USD: bake points instead of UsdSkel)] [-bo (FBX: bake joint orients)]
+  file -import path.fbx|path.glb|path.gltf|path.usd*|path.obj [-take animName]   (FBX: hierarchy, meshes, materials+textures, skins, blend shapes, takes, lights, cameras)
+  polyReduce [-p percentToRemove] [-kb 0|1] meshes   polySoftEdge [-a angle] meshes | mesh.e[...]   (0 = hard, 180 = soft)   (glTF: hierarchy, meshes+UVs, materials+textures, skins, blend shapes, animation, lights, cameras)
 UVs and textures:
   polyPlanarProjection [-md x|y|z|b] | polyCylindricalProjection | polySphericalProjection | polyAutoProjection  [objects]
   polyMapCut [-e edgeIdx...] [mesh] (cut along selected edges)   polyMapSewMove [-e ...] (move & sew)   u3dUnfold [mesh] (LSCM unfold)
@@ -75,15 +76,30 @@ FX (simulate as the time slider plays; cached per frame):
   clothPin [-to node] mesh.vtx[0:10] ...   clothPin -clear mesh
   setAttr cloth.stretch|bend|damping|drag|thickness|friction|substeps|iterations|startFrame v   setAttr cloth.wind x y z
   connectDynamic -c colliderMesh particlesOrCloth   connectDynamic -d colliderMesh target
+  nCloth -selfCollide mesh   setAttr cloth.selfCollide 1 | cloth.selfThickness r
+  airField|gravityField|uniformField|radialField|vortexField|turbulenceField|dragField|newtonField [-m mag] [-att a] [-mxd dist]
+           [-dx x -dy y -dz z] [-f freq] [-s speed] [-p x y z] [-n name] [targets]   (field -type air ...)
+  connectDynamic -f field target | -rf field target   (no targets = acts on every simulation)
+  hairSystem [-count N] [-length L] [-lr 0.2] [-seg 8] [-curl deg] [-tilt deg] [-stiff 0.25] [-width w] [-rgb r g b] [-tip r g b] [-n name] mesh
+  makeCurvesDynamic [-pinTip] curves   (→ <curve>_dyn output curves)   hairToCurves hairSystem
 Recipes:
   lightRig -preset studio|outdoor|sunset|night|product|dramatic [-i 1] [-target objects]   (replaces the lightRig group)
   materialPreset -p gold|silver|chrome|copper|brass|brushed_metal|plastic|rubber|glass|water|wood|concrete|marble|ceramic|car_paint|skin|fabric|neon|grass [-rgb r g b] [-n name] [objects]
   rigAnimate -anim walk|run|jump|wave|idle|dance [-s 1] [-e 96] [-travel on|off] [mesh]   (Quick Rigs the mesh first if needed)
   renderCheck [-x 320 -y 180 -spp 16] [-cam camera]   (preview render + exposure/framing/lighting report)
+Director / posing / rig check:
+  makeShot -theme forest|city|desert|beach|studio|snow|space [-subject human|robot|alien|none] [-anim walk|...] [-mood sunset|...]
+           [-camera static|track|dolly|orbit|crane] [-fx rain|snow|sparks|fireflies|dust|leaves|cape|flag]... [-wind] [-s 1 -e 120] [-clear]
+  character -style human|robot|alien [-h 1.8] [-p x y z] [-n name]   environment -theme forest [-size 24] [-density 1] [-seed 7]
+  shotCamera -type static|track|dolly|orbit|crane [-target obj] [-s 1 -e 120] [-n name]   fxPreset rain|snow|sparks|fireflies|dust|leaves|cape|flag [-wind]
+  pose -part arm|elbow|leg|knee|foot|head|chest|hips [-side L|R|both] -action raise|lower|forward|back|bend|straighten|lift|step|turn|nod|tilt|lean|twist|crouch|stand
+       [-dir left|right|forward|back|up|down] [-amount small|large|<deg>|<n>cm] [-key]
+  rigReport (alias explainRig)   skinPercent -normalize mesh
 Rendering (CPU path tracer):
   render [-x 960 -y 540] [-spp 64] [-b 4] [-cam camera] [-o file.png]   render -seq -st 1 -e 24 -o C:/out/name
-  renderSettings [-x W -y H -spp N -b N -env sky -exp stops -tm srgb|filmic -bg env|black -clamp 4 -dn on|off -cam cam|-av]
-  renderView [-ipr on|off] [-stop] [-save file.png [-passes]]   render ... -o file.png -passes (beauty/albedo/normal/depth/objectid)
+  renderSettings [-x W -y H -spp N -b N -env sky -exp stops -tm srgb|filmic -bg env|black -clamp 4 -dn on|off -mb on|off -shutter 0.5 -cam cam|-av]
+  renderView [-ipr on|off] [-stop] [-save file.png [-passes]]   render ... -o file.png|.exr -passes [list] (beauty albedo normal depth objectid diffuse_direct diffuse_indirect specular emission)
+  batch (no window): rust_maya --render scene.rma [-s 1 -e 120] [-cam c] [-o out.png] [-passes] [-mb on]   (rust_maya --help)
   renderSettings -region x0 y0 x1 y1 (0..1, top-left) | -region off
 Look dev:
   shadingNode -asShader lambert|blinn|phong|standardSurface -n name [-rgb r g b]
@@ -372,7 +388,7 @@ fn parse_component(app: &App, spec: &str) -> Option<Result<CompSpec, String>> {
 
 fn run(app: &mut App, stmt: &str) -> Result<String, String> {
     let mut tokens = tokenize(stmt);
-    if let Some(r) = crate::curve_ops::mel(app, &tokens).or_else(|| crate::quad_draw::mel(app, &tokens)).or_else(|| crate::fx::mel(app, &tokens)) {
+    if let Some(r) = crate::curve_ops::mel(app, &tokens).or_else(|| crate::quad_draw::mel(app, &tokens)).or_else(|| crate::fx::mel(app, &tokens)).or_else(|| crate::director::mel(app, &tokens)).or_else(|| crate::rig_report::mel(app, &tokens)).or_else(|| crate::posing::mel(app, &tokens)).or_else(|| crate::reduce::mel(app, &tokens)) {
         return r;
     }
     let pos_flag = take_vec3(&mut tokens, &["p", "position"]);
@@ -813,12 +829,12 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 app.new_scene();
                 Ok(String::new())
             } else if a.has("import") || a.has("i") {
-                let path: String = a.positional.first().cloned().or(a.get("i").map(String::from)).ok_or("file -import: missing path (.glb, .gltf or .obj)")?;
+                let path: String = a.positional.first().cloned().or(a.get("i").map(String::from)).ok_or("file -import: missing path (.fbx, .glb, .gltf, .usd or .obj)")?;
                 let p = std::path::PathBuf::from(path.trim_matches('"'));
                 let take = rest.iter().position(|t| t == "-take").and_then(|i| rest.get(i + 1)).cloned();
                 crate::importer::import_take(app, &p, take.as_deref())
             } else if a.has("export") || a.has("ea") || a.has("es") || a.has("exportAll") || a.has("exportSelected") {
-                let path = a.positional.first().ok_or("file -export: missing path (.glb, .gltf, .usda or .obj)")?;
+                let path = a.positional.first().ok_or("file -export: missing path (.glb, .gltf, .fbx, .usda or .obj)")?;
                 let sel = a.has("es") || a.has("exportSelected");
                 let p = std::path::PathBuf::from(path.trim_matches('"'));
                 if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("obj")) {
@@ -828,6 +844,9 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 let mut opts = crate::export::ExportOptions::from_app(app, sel);
                 if a.has("noAnim") || a.has("na") {
                     opts.animation = false;
+                }
+                if a.has("bakeOrient") || a.has("bo") {
+                    opts.fbx_bake_orient = true;
                 }
                 if a.has("bakePoints") || a.has("bp") {
                     opts.usd_skel = false;
@@ -1428,6 +1447,15 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             if let Some(v) = val("-bg").or(val("-background")) {
                 s.env_background = matches!(v.as_str(), "env" | "sky" | "environment" | "on" | "1");
             }
+            if let Some(v) = val("-mb").or(val("-motionBlur")) {
+                s.motion_blur = matches!(v.as_str(), "on" | "1" | "true");
+            }
+            if let Some(v) = num("-shutter") {
+                s.shutter = v.clamp(0.0, 2.0);
+                if !flag("-mb") && !flag("-motionBlur") {
+                    s.motion_blur = s.shutter > 0.0;
+                }
+            }
             let cam = val("-cam").or(val("-camera"));
             let quote = |p: String| p.trim_matches('"').to_string();
             if cmd == "renderSettings" {
@@ -1438,7 +1466,8 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 } else if flag("-activeView") || flag("-av") {
                     app.render.camera = crate::render_view::RenderCam::ActiveView;
                 }
-                return Ok(format!("{}x{} {} spp, {} bounces", s.width, s.height, s.spp, s.bounces));
+                let mb = if s.motion_blur { format!(", motion blur {} frame", s.shutter) } else { String::new() };
+                return Ok(format!("{}x{} {} spp, {} bounces{mb}", s.width, s.height, s.spp, s.bounces));
             }
             if cmd == "renderView" {
                 if flag("-stop") {
@@ -1463,8 +1492,8 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 let st = num("-st").or(num("-start")).unwrap_or(app.scene.play_start) as i32;
                 let en = num("-e").or(num("-end")).unwrap_or(app.scene.play_end) as i32;
                 let out = val("-o").map(quote).ok_or("render -seq needs -o C:/path/name")?;
-                if cfg!(test) {
-                    let n = app.render_sequence_now(cam.as_deref(), s, st, en, &out)?;
+                if cfg!(test) || flag("-passes") {
+                    let n = app.render_frames(cam.as_deref(), s, st, en, &out, flag("-passes"), &mut |_, _, _| {})?;
                     return Ok(format!("{n} frames"));
                 }
                 app.render.settings = s;
@@ -1474,7 +1503,12 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             if let Some(out) = val("-o").map(quote) {
                 let job = app.render_now(cam.as_deref(), s.clone())?;
                 if flag("-passes") {
-                    let files = job.save_passes(std::path::Path::new(&out), s.exposure, s.tonemap)?;
+                    // `-passes` = all; `-passes specular,emission` = just those.
+                    let list = match val("-passes").filter(|v| !v.starts_with('-')) {
+                        Some(v) => v.split(',').filter(|x| !x.is_empty()).map(|x| crate::raytrace::Pass::from_name(x).ok_or_else(|| format!("Unknown pass '{x}'"))).collect::<Result<Vec<_>, _>>()?,
+                        None => crate::raytrace::Pass::ALL.to_vec(),
+                    };
+                    let files = job.save_pass_list(std::path::Path::new(&out), &list, s.exposure, s.tonemap)?;
                     return Ok(files.join(" "));
                 }
                 job.save_png(std::path::Path::new(&out), s.exposure, s.tonemap)?;

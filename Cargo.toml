@@ -23,6 +23,8 @@ serde_json = "1.0.154"
 # .usdz packages are unpacked with zip.
 openusd = { version = "0.8.0", default-features = false }
 zip = { version = "8.2.0", default-features = false, features = ["deflate"] }
+# FBX binary arrays are zlib-compressed.
+flate2 = "1.1.10"
 
 [features]
 default = ["voice"]

@@ -17,11 +17,12 @@ pub fn import_take(app: &mut App, path: &Path, take: Option<&str>) -> Result<Str
     match ext.as_str() {
         "glb" | "gltf" => gltf::import(app, path, take).map(|r| r.summary()),
         "usda" | "usd" | "usdc" | "usdz" => usd::import(app, path).map(|r| r.summary()),
+        "fbx" => crate::fbx::import::import(app, path, take).map(|r| r.summary()),
         "obj" => {
             app.import_obj(path.to_path_buf());
             Ok(String::new())
         }
-        _ => Err(format!("Unknown import format '.{ext}' (use .glb, .gltf, .usd/.usda/.usdc/.usdz or .obj)")),
+        _ => Err(format!("Unknown import format '.{ext}' (use .fbx, .glb, .gltf, .usd/.usda/.usdc/.usdz or .obj)")),
     }
 }
 

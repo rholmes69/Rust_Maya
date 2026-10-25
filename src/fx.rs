@@ -9,6 +9,10 @@
 //! Particles are a shape (`Shape::Particles`) drawn as small octahedra, so they show in the
 //! viewport and the path tracer. Cloth is a deformer on a mesh (`Node::cloth`): the simulated
 //! points replace the mesh's points, so the viewport, renderer and USD export use them.
+//!
+//! Fields (`Shape::Field`: air, gravity, uniform, radial, vortex, turbulence, drag, newton) are
+//! scene nodes whose transform places and aims them; they push particles, cloth and hair
+//! (`crate::hair`). A field with no targets affects every simulation.
 
 use crate::scene::{Channel, NodeId, Scene, Shape};
 use glam::{Mat4, Vec3};
@@ -81,12 +85,12 @@ pub fn turbulence(p: Vec3, t: f32, freq: f32) -> Vec3 {
     )
 }
 
-fn hash_f(h: &mut impl std::hash::Hasher, v: f32) {
+pub(crate) fn hash_f(h: &mut impl std::hash::Hasher, v: f32) {
     h.write_u32(v.to_bits());
 }
 
 /// Hash of a node's motion inputs: anim curves, plus static values of unanimated channels.
-fn motion_hash(scene: &Scene, id: NodeId, h: &mut impl std::hash::Hasher) {
+pub(crate) fn motion_hash(scene: &Scene, id: NodeId, h: &mut impl std::hash::Hasher) {
     use std::hash::Hash;
     let mut cur = Some(id);
     let mut guard = 0;
@@ -296,6 +300,10 @@ pub struct ClothSettings {
     pub pins: Vec<u32>,
     pub pin_to: Option<NodeId>,
     pub start: f32,
+    /// Keep the cloth from passing through itself (vertex–vertex repulsion).
+    pub self_collide: bool,
+    /// Self-collision radius per vertex (0 = auto: 45 % of the average edge length).
+    pub self_thickness: f32,
 }
 
 impl Default for ClothSettings {
@@ -317,6 +325,8 @@ impl Default for ClothSettings {
             pins: Vec::new(),
             pin_to: None,
             start: 1.0,
+            self_collide: false,
+            self_thickness: 0.0,
         }
     }
 }
@@ -343,7 +353,7 @@ impl Cloth {
 
 // ------------------------------------------------------------------------------ attributes
 
-fn v3(vals: &[f32]) -> Result<Vec3, String> {
+pub(crate) fn v3(vals: &[f32]) -> Result<Vec3, String> {
     match vals {
         [x, y, z, ..] => Ok(Vec3::new(*x, *y, *z)),
         [v] => Ok(Vec3::splat(*v)),
@@ -351,7 +361,7 @@ fn v3(vals: &[f32]) -> Result<Vec3, String> {
     }
 }
 
-fn one(vals: &[f32]) -> Result<f32, String> {
+pub(crate) fn one(vals: &[f32]) -> Result<f32, String> {
     vals.first().copied().ok_or_else(|| "expected a value".to_string())
 }
 
@@ -403,7 +413,9 @@ impl ClothSettings {
             "ground" => self.ground = one(vals)? > 0.5,
             "groundHeight" => self.ground_height = one(vals)?,
             "startFrame" => self.start = one(vals)?,
-            _ => return Err(format!("Unknown cloth attribute '{attr}' (stretch bend damping gravity wind drag substeps iterations thickness friction ground groundHeight startFrame)")),
+            "selfCollide" | "selfCollision" => self.self_collide = one(vals)? > 0.5,
+            "selfThickness" | "selfCollideWidth" => self.self_thickness = one(vals)?.max(0.0),
+            _ => return Err(format!("Unknown cloth attribute '{attr}' (stretch bend damping gravity wind drag substeps iterations thickness friction ground groundHeight startFrame selfCollide selfThickness)")),
         }
         Ok(())
     }
@@ -531,14 +543,14 @@ impl TriGrid {
 
 /// A light copy of the scene for evaluating transforms (and keeping only the meshes the
 /// simulation reads) at past / future frames.
-struct Tracks {
-    sc: Scene,
+pub(crate) struct Tracks {
+    pub(crate) sc: Scene,
 }
 
 impl Tracks {
     /// Copy the scene without the heavy data the simulation doesn't read (meshes, skin weights
     /// and blend shapes of other objects are set aside during the clone, then restored).
-    fn new(scene: &mut Scene, keep_meshes: &[NodeId]) -> Tracks {
+    pub(crate) fn new(scene: &mut Scene, keep_meshes: &[NodeId]) -> Tracks {
         let mut stash: Vec<(usize, crate::mesh::Mesh, Option<crate::rig::Skin>, Option<crate::rig::BlendShape>)> = Vec::new();
         for (i, n) in scene.nodes.iter_mut().enumerate() {
             if keep_meshes.contains(&n.id) {
@@ -560,7 +572,7 @@ impl Tracks {
         for n in &mut sc.nodes {
             n.surf = None;
             n.cloth = None;
-            if matches!(n.shape, Shape::Particles(_)) {
+            if matches!(n.shape, Shape::Particles(_) | Shape::Hair(_)) {
                 n.shape = Shape::Locator;
             }
             if !keep_meshes.contains(&n.id) {
@@ -576,18 +588,18 @@ impl Tracks {
         Tracks { sc }
     }
 
-    fn goto(&mut self, frame: f32) {
+    pub(crate) fn goto(&mut self, frame: f32) {
         self.sc.time = frame;
         self.sc.evaluate();
         crate::rig::evaluate(&mut self.sc);
     }
 
-    fn world(&self, id: NodeId) -> Mat4 {
+    pub(crate) fn world(&self, id: NodeId) -> Mat4 {
         self.sc.world_matrix(id)
     }
 
     /// World positions of a mesh node (deformed when it has deformers).
-    fn mesh_world(&self, id: NodeId) -> Option<(Vec<Vec3>, Vec<Vec<u32>>)> {
+    pub(crate) fn mesh_world(&self, id: NodeId) -> Option<(Vec<Vec3>, Vec<Vec<u32>>)> {
         let n = self.sc.node(id)?;
         let m = n.mesh()?;
         let pts = crate::rig::deformed_positions(&self.sc, id).unwrap_or_else(|| {
@@ -597,7 +609,7 @@ impl Tracks {
         Some((pts, m.faces.clone()))
     }
 
-    fn colliders(&self, ids: &[NodeId]) -> TriGrid {
+    pub(crate) fn colliders(&self, ids: &[NodeId]) -> TriGrid {
         let mut tris = Vec::new();
         for id in ids {
             if let Some((p, faces)) = self.mesh_world(*id) {
@@ -610,6 +622,288 @@ impl Tracks {
         }
         TriGrid::new(tris)
     }
+
+    /// The fields acting on `target`, evaluated at the current frame.
+    pub(crate) fn fields(&self, target: NodeId) -> FieldSet {
+        FieldSet::eval(&self.sc, target)
+    }
+}
+
+// ------------------------------------------------------------------------------ fields
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldKind {
+    /// Pushes toward a wind velocity (`direction` × magnitude m/s) at rate `speed`.
+    Air,
+    /// Constant acceleration along `direction` (default down).
+    Gravity,
+    /// Constant force along `direction`.
+    Uniform,
+    /// Away from the field's position (negative magnitude pulls in).
+    Radial,
+    /// Around the field's axis (`direction`).
+    Vortex,
+    /// Smooth noise; `frequency` sets its scale and `speed` how fast it changes.
+    Turbulence,
+    /// Slows things down (proportional to velocity).
+    Drag,
+    /// Attraction toward the field's position (use attenuation 2 for inverse-square).
+    Newton,
+}
+
+impl FieldKind {
+    pub const ALL: [FieldKind; 8] = [FieldKind::Air, FieldKind::Gravity, FieldKind::Uniform, FieldKind::Radial, FieldKind::Vortex, FieldKind::Turbulence, FieldKind::Drag, FieldKind::Newton];
+    pub fn parse(s: &str) -> Option<FieldKind> {
+        let s = s.to_lowercase();
+        let s = s.trim_end_matches("field");
+        Some(match s {
+            "air" | "wind" => FieldKind::Air,
+            "gravity" => FieldKind::Gravity,
+            "uniform" | "push" => FieldKind::Uniform,
+            "radial" => FieldKind::Radial,
+            "vortex" | "swirl" => FieldKind::Vortex,
+            "turbulence" | "noise" => FieldKind::Turbulence,
+            "drag" => FieldKind::Drag,
+            "newton" | "attract" | "attractor" => FieldKind::Newton,
+            _ => return None,
+        })
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            FieldKind::Air => "air",
+            FieldKind::Gravity => "gravity",
+            FieldKind::Uniform => "uniform",
+            FieldKind::Radial => "radial",
+            FieldKind::Vortex => "vortex",
+            FieldKind::Turbulence => "turbulence",
+            FieldKind::Drag => "drag",
+            FieldKind::Newton => "newton",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Field {
+    pub kind: FieldKind,
+    pub magnitude: f32,
+    /// Direction / axis in the field node's space.
+    pub direction: Vec3,
+    /// Falloff exponent: strength × (1 + distance)^-attenuation.
+    pub attenuation: f32,
+    /// Beyond this distance the field does nothing (0 = no limit).
+    pub max_distance: f32,
+    /// Turbulence spatial frequency.
+    pub frequency: f32,
+    /// Air: how fast things reach the wind speed (1/s). Turbulence: how fast the noise changes.
+    pub speed: f32,
+    /// Simulations this field acts on (empty = all of them).
+    pub targets: Vec<NodeId>,
+}
+
+impl Default for Field {
+    fn default() -> Self {
+        Field::new(FieldKind::Air)
+    }
+}
+
+impl Field {
+    pub fn new(kind: FieldKind) -> Field {
+        let (magnitude, direction, attenuation) = match kind {
+            FieldKind::Air => (4.0, Vec3::X, 0.0),
+            FieldKind::Gravity => (9.81, Vec3::NEG_Y, 0.0),
+            FieldKind::Uniform => (3.0, Vec3::X, 0.0),
+            FieldKind::Radial => (5.0, Vec3::Y, 1.0),
+            FieldKind::Vortex => (5.0, Vec3::Y, 1.0),
+            FieldKind::Turbulence => (5.0, Vec3::Y, 0.0),
+            FieldKind::Drag => (0.5, Vec3::Y, 0.0),
+            FieldKind::Newton => (5.0, Vec3::Y, 1.0),
+        };
+        Field { kind, magnitude, direction, attenuation, max_distance: 0.0, frequency: 1.0, speed: 1.0, targets: Vec::new() }
+    }
+
+    pub fn affects(&self, id: NodeId) -> bool {
+        self.targets.is_empty() || self.targets.contains(&id)
+    }
+
+    pub fn set_attr(&mut self, attr: &str, vals: &[f32]) -> Result<(), String> {
+        match attr {
+            "magnitude" | "mag" | "m" => self.magnitude = one(vals)?,
+            "direction" | "dir" | "axis" => self.direction = v3(vals)?,
+            "attenuation" | "att" => self.attenuation = one(vals)?.max(0.0),
+            "maxDistance" | "mxd" => self.max_distance = one(vals)?.max(0.0),
+            "frequency" | "freq" | "f" => self.frequency = one(vals)?.max(0.0),
+            "speed" | "phase" => self.speed = one(vals)?.max(0.0),
+            _ => return Err(format!("Unknown field attribute '{attr}' (magnitude direction attenuation maxDistance frequency speed)")),
+        }
+        Ok(())
+    }
+}
+
+/// One field evaluated in world space at a frame.
+#[derive(Clone, Debug)]
+pub struct FieldEval {
+    pub f: Field,
+    pub origin: Vec3,
+    /// World direction / axis (normalised).
+    pub dir: Vec3,
+}
+
+/// The fields acting on one simulation at one frame.
+#[derive(Clone, Debug, Default)]
+pub struct FieldSet(pub Vec<FieldEval>);
+
+impl FieldSet {
+    pub fn eval(scene: &Scene, target: NodeId) -> FieldSet {
+        let mut out = Vec::new();
+        for n in &scene.nodes {
+            if let Shape::Field(f) = &n.shape
+                && f.affects(target)
+                && scene.is_visible(n.id)
+            {
+                let w = scene.world_matrix(n.id);
+                out.push(FieldEval { f: f.clone(), origin: w.transform_point3(Vec3::ZERO), dir: w.transform_vector3(f.direction).normalize_or(Vec3::Y) });
+            }
+        }
+        FieldSet(out)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Total acceleration at `p` moving with `v` at time `t` (seconds), for particles and hair.
+    pub fn accel(&self, p: Vec3, v: Vec3, t: f32) -> Vec3 {
+        let (a, _, air) = self.sample(p, v, t);
+        a + air
+    }
+
+    /// (acceleration from non-air fields, air wind velocity, air pull toward that wind).
+    /// Cloth uses the wind through its aerodynamic model instead of the air pull.
+    pub fn sample(&self, p: Vec3, v: Vec3, t: f32) -> (Vec3, Vec3, Vec3) {
+        let mut acc = Vec3::ZERO;
+        let mut wind = Vec3::ZERO;
+        let mut air = Vec3::ZERO;
+        for e in &self.0 {
+            let f = &e.f;
+            let r = p - e.origin;
+            let d = r.length();
+            let mut k = f.magnitude;
+            if f.max_distance > 0.0 {
+                if d >= f.max_distance {
+                    continue;
+                }
+                // Soft edge over the outer 10 %.
+                k *= ((f.max_distance - d) / (0.1 * f.max_distance)).min(1.0);
+            }
+            if f.attenuation > 0.0 {
+                k *= (1.0 + d).powf(-f.attenuation);
+            }
+            match f.kind {
+                FieldKind::Air => {
+                    let w = e.dir * k;
+                    wind += w;
+                    air += (w - v) * f.speed;
+                }
+                FieldKind::Gravity | FieldKind::Uniform => acc += e.dir * k,
+                FieldKind::Radial => acc += r.normalize_or_zero() * k,
+                FieldKind::Newton => acc -= r.normalize_or_zero() * k,
+                FieldKind::Vortex => acc += e.dir.cross(r).normalize_or_zero() * k,
+                FieldKind::Turbulence => acc += turbulence(p, t * f.speed, f.frequency) * k,
+                FieldKind::Drag => acc -= v * k,
+            }
+        }
+        (acc, wind, air)
+    }
+}
+
+/// Fields acting on `target` (for cache keys).
+pub(crate) fn hash_fields(scene: &Scene, target: NodeId, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    for n in &scene.nodes {
+        if let Shape::Field(f) = &n.shape
+            && f.affects(target)
+        {
+            format!("{f:?}").hash(h);
+            scene.is_visible(n.id).hash(h);
+            motion_hash(scene, n.id, h);
+        }
+    }
+}
+
+/// Wire icon of a field (local space line segments).
+pub fn field_icon(f: &Field) -> Vec<(Vec3, Vec3)> {
+    let mut l = Vec::new();
+    let d = f.direction.normalize_or(Vec3::Y);
+    let (bx, by) = {
+        let t = if d.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+        let bx = d.cross(t).normalize();
+        (bx, d.cross(bx))
+    };
+    let arrow = |l: &mut Vec<(Vec3, Vec3)>, o: Vec3, d: Vec3, len: f32| {
+        let tip = o + d * len;
+        l.push((o, tip));
+        l.push((tip, tip - d * 0.15 + bx * 0.08));
+        l.push((tip, tip - d * 0.15 - bx * 0.08));
+    };
+    let circle = |l: &mut Vec<(Vec3, Vec3)>, r: f32, h: f32| {
+        for i in 0..16 {
+            let a0 = i as f32 / 16.0 * std::f32::consts::TAU;
+            let a1 = (i + 1) as f32 / 16.0 * std::f32::consts::TAU;
+            l.push((bx * a0.cos() * r + by * a0.sin() * r + d * h, bx * a1.cos() * r + by * a1.sin() * r + d * h));
+        }
+    };
+    match f.kind {
+        FieldKind::Air | FieldKind::Uniform => {
+            for o in [-0.2, 0.0, 0.2] {
+                arrow(&mut l, by * o - d * 0.3, d, 0.6);
+            }
+        }
+        FieldKind::Gravity => {
+            arrow(&mut l, -d * 0.3, d, 0.6);
+            circle(&mut l, 0.25, -0.3);
+        }
+        FieldKind::Radial | FieldKind::Newton => {
+            for v in [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z] {
+                if f.kind == FieldKind::Radial {
+                    arrow(&mut l, v * 0.1, v, 0.35);
+                } else {
+                    arrow(&mut l, v * 0.45, -v, 0.35);
+                }
+            }
+        }
+        FieldKind::Vortex => {
+            circle(&mut l, 0.35, 0.0);
+            circle(&mut l, 0.2, 0.15);
+            l.push((-d * 0.3, d * 0.4));
+        }
+        FieldKind::Turbulence => {
+            for k in 0..3 {
+                let y = (k as f32 - 1.0) * 0.2;
+                for i in 0..10 {
+                    let x0 = -0.4 + i as f32 * 0.08;
+                    let x1 = x0 + 0.08;
+                    l.push((bx * x0 + by * y + d * ((x0 * 12.0).sin() * 0.06), bx * x1 + by * y + d * ((x1 * 12.0).sin() * 0.06)));
+                }
+            }
+        }
+        FieldKind::Drag => {
+            circle(&mut l, 0.3, 0.0);
+            arrow(&mut l, d * 0.5, -d, 0.45);
+        }
+    }
+    if f.max_distance > 0.0 {
+        // Max-distance ring (three great circles).
+        let r = f.max_distance;
+        for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)] {
+            for i in 0..32 {
+                let a0 = i as f32 / 32.0 * std::f32::consts::TAU;
+                let a1 = (i + 1) as f32 / 32.0 * std::f32::consts::TAU;
+                l.push(((a * a0.cos() + b * a0.sin()) * r, (a * a1.cos() + b * a1.sin()) * r));
+            }
+        }
+    }
+    l
 }
 
 // ------------------------------------------------------------------------------ particles
@@ -620,6 +914,7 @@ fn particle_key(scene: &Scene, id: NodeId, s: &ParticleSettings) -> u64 {
     format!("{s:?}").hash(&mut h);
     scene.fps.to_bits().hash(&mut h);
     motion_hash(scene, id, &mut h);
+    hash_fields(scene, id, &mut h);
     for c in s.source.iter().chain(&s.colliders) {
         motion_hash(scene, *c, &mut h);
         if let Some(n) = scene.node(*c) {
@@ -706,7 +1001,8 @@ impl Source {
     }
 }
 
-fn step_particles(prev: &ParticleFrame, s: &ParticleSettings, tr: &Tracks, emitter: NodeId, frame_index: usize, fps: f32, grid: &TriGrid) -> ParticleFrame {
+#[allow(clippy::too_many_arguments)]
+fn step_particles(prev: &ParticleFrame, s: &ParticleSettings, tr: &Tracks, emitter: NodeId, frame_index: usize, fps: f32, grid: &TriGrid, fields: &FieldSet) -> ParticleFrame {
     let mut out = prev.clone();
     let sub = s.substeps.clamp(1, 16) as usize;
     let dt = 1.0 / fps.max(1.0) / sub as f32;
@@ -737,6 +1033,9 @@ fn step_particles(prev: &ParticleFrame, s: &ParticleSettings, tr: &Tracks, emitt
             let mut a = s.gravity + (s.wind - q.v) * s.drag;
             if s.turbulence > 0.0 {
                 a += turbulence(q.p, t, s.turbulence_freq) * s.turbulence;
+            }
+            if !fields.is_empty() {
+                a += fields.accel(q.p, q.v, t);
             }
             q.v += a * dt;
             let mut np = q.p + q.v * dt;
@@ -807,6 +1106,7 @@ fn cloth_key(scene: &Scene, id: NodeId, s: &ClothSettings) -> u64 {
     format!("{s:?}").hash(&mut h);
     scene.fps.to_bits().hash(&mut h);
     motion_hash(scene, id, &mut h);
+    hash_fields(scene, id, &mut h);
     if let Some(n) = scene.node(id) {
         n.mesh_rev().hash(&mut h);
         if let Some(sk) = &n.skin {
@@ -831,6 +1131,10 @@ fn cloth_key(scene: &Scene, id: NodeId, s: &ClothSettings) -> u64 {
 
 struct ClothSetup {
     cons: Vec<(u32, u32, f32, u8)>,
+    /// Start positions (self-collision skips pairs that are this close at rest).
+    rest: Vec<Vec3>,
+    /// Self-collision radius (0 = off).
+    self_r: f32,
     faces: Vec<Vec<u32>>,
     inv_mass: Vec<f32>,
     /// Pinned vertex → position in the pin node's space at the start frame.
@@ -850,10 +1154,21 @@ fn cloth_setup(tr: &Tracks, id: NodeId, s: &ClothSettings, start_pos: &[Vec3], f
             pin_local.push((v, inv.transform_point3(*p)));
         }
     }
-    ClothSetup { cons, faces: faces.to_vec(), inv_mass, pin_local, pin_node }
+    let self_r = if s.self_collide {
+        if s.self_thickness > 0.0 {
+            s.self_thickness
+        } else {
+            let edges: Vec<f32> = cons.iter().filter(|c| c.3 == 0).map(|c| c.2).collect();
+            0.45 * edges.iter().sum::<f32>() / edges.len().max(1) as f32
+        }
+    } else {
+        0.0
+    };
+    ClothSetup { cons, rest: start_pos.to_vec(), self_r, faces: faces.to_vec(), inv_mass, pin_local, pin_node }
 }
 
-fn step_cloth(prev: &ClothFrame, s: &ClothSettings, setup: &ClothSetup, tr: &Tracks, fps: f32, grid: &TriGrid) -> ClothFrame {
+#[allow(clippy::too_many_arguments)]
+fn step_cloth(prev: &ClothFrame, s: &ClothSettings, setup: &ClothSetup, tr: &Tracks, fps: f32, grid: &TriGrid, fields: &FieldSet, t0: f32) -> ClothFrame {
     let sub = s.substeps.clamp(1, 64) as usize;
     let iters = s.iterations.clamp(1, 32) as usize;
     let dt = 1.0 / fps.max(1.0) / sub as f32;
@@ -892,9 +1207,11 @@ fn step_cloth(prev: &ClothFrame, s: &ClothSettings, setup: &ClothSetup, tr: &Tra
             let v = (pos[i] - old[i]) / dt * keep;
             // Aerodynamics: the relative wind pushes along the surface normal (sails, flags),
             // with a little tangential drag.
-            let rel = s.wind - v;
+            // Air fields act through the aerodynamic term (not their direct pull).
+            let (fa, fw, _) = if fields.is_empty() { (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO) } else { fields.sample(pos[i], v, t0 + step as f32 * dt) };
+            let rel = s.wind + fw - v;
             let n = nrm[i];
-            let a = s.gravity + n * (rel.dot(n) * s.drag) + (rel - n * rel.dot(n)) * (s.drag * 0.05);
+            let a = s.gravity + fa + n * (rel.dot(n) * s.drag) + (rel - n * rel.dot(n)) * (s.drag * 0.05);
             old[i] = pos[i];
             pos[i] += v * dt + a * dt * dt;
         }
@@ -920,6 +1237,9 @@ fn step_cloth(prev: &ClothFrame, s: &ClothSettings, setup: &ClothSetup, tr: &Tra
                 pos[a] += c * wa;
                 pos[b] -= c * wb;
             }
+        }
+        if setup.self_r > 0.0 {
+            self_collide(&mut pos, setup);
         }
         // Collisions (after the constraints, so nothing ends up inside).
         for i in 0..pos.len() {
@@ -948,6 +1268,56 @@ fn step_cloth(prev: &ClothFrame, s: &ClothSettings, setup: &ClothSetup, tr: &Tra
         }
     }
     ClothFrame { pos, prev: old }
+}
+
+/// Push apart vertices closer than twice the self-collision radius (pairs that were close at
+/// rest — neighbours — are skipped). Uniform hash grid, two passes.
+fn self_collide(pos: &mut [Vec3], setup: &ClothSetup) {
+    let r = setup.self_r;
+    let dia = 2.0 * r;
+    let skip = dia * 1.25;
+    let cell = dia;
+    let key = |p: Vec3| {
+        let q = (p / cell).floor();
+        [q.x as i32, q.y as i32, q.z as i32]
+    };
+    for _ in 0..2 {
+        let mut grid: HashMap<[i32; 3], Vec<u32>> = HashMap::with_capacity(pos.len());
+        for (i, p) in pos.iter().enumerate() {
+            grid.entry(key(*p)).or_default().push(i as u32);
+        }
+        for i in 0..pos.len() {
+            let k = key(pos[i]);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let Some(list) = grid.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) else { continue };
+                        for &j in list {
+                            let j = j as usize;
+                            if j <= i {
+                                continue;
+                            }
+                            let d = pos[j] - pos[i];
+                            let l2 = d.length_squared();
+                            if l2 >= dia * dia || setup.rest[i].distance_squared(setup.rest[j]) < skip * skip {
+                                continue;
+                            }
+                            let (wi, wj) = (setup.inv_mass[i], setup.inv_mass[j]);
+                            let w = wi + wj;
+                            if w == 0.0 {
+                                continue;
+                            }
+                            let l = l2.sqrt();
+                            let n = if l > 1e-9 { d / l } else { Vec3::Y };
+                            let c = n * ((dia - l) / w);
+                            pos[i] -= c * wi;
+                            pos[j] += c * wj;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------ update
@@ -980,7 +1350,8 @@ pub fn update(scene: &mut Scene) {
                     let f = s.start + k as f32;
                     tr.goto(f);
                     let grid = tr.colliders(&s.colliders);
-                    let next = step_particles(cache.frames.last().unwrap(), &s, &tr, id, k, fps, &grid);
+                    let fields = tr.fields(id);
+                    let next = step_particles(cache.frames.last().unwrap(), &s, &tr, id, k, fps, &grid, &fields);
                     cache.frames.push(Arc::new(next));
                 }
             }
@@ -1013,7 +1384,8 @@ pub fn update(scene: &mut Scene) {
                 for k in cache.frames.len()..=target {
                     tr.goto(s.start + k as f32);
                     let grid = tr.colliders(&s.colliders);
-                    let next = step_cloth(cache.frames.last().unwrap(), &s, &setup, &tr, fps, &grid);
+                    let fields = tr.fields(id);
+                    let next = step_cloth(cache.frames.last().unwrap(), &s, &setup, &tr, fps, &grid, &fields, k as f32 / fps.max(1.0));
                     cache.frames.push(Arc::new(next));
                 }
             }
@@ -1137,6 +1509,45 @@ impl App {
         Ok(c.settings.pins.len())
     }
 
+    /// Create a field. When dynamics objects are selected it acts on them only; otherwise on all.
+    pub fn create_field(&mut self, mut f: Field, at: Option<Vec3>, name: Option<&str>, targets: Vec<NodeId>) -> Result<NodeId, String> {
+        f.targets = targets;
+        self.checkpoint();
+        let id = self.scene.add_node(&format!("{}Field1", f.kind.name()), Shape::Field(f), None);
+        self.apply_name(id, name);
+        if let Some(p) = at
+            && let Some(n) = self.scene.node_mut(id)
+        {
+            n.translate = p;
+        }
+        self.sel = vec![id];
+        Ok(id)
+    }
+
+    /// Restrict a field to a simulation (or remove it from the field's targets).
+    pub fn connect_field(&mut self, field: NodeId, target: NodeId, remove: bool) -> Result<(), String> {
+        let ok = self.scene.node(target).is_some_and(|n| matches!(n.shape, Shape::Particles(_) | Shape::Hair(_)) || n.cloth.is_some());
+        if !ok {
+            return Err("connectDynamic -f: the target must be a particle system, an nCloth mesh or a hair system.".into());
+        }
+        if !matches!(self.scene.node(field).map(|n| &n.shape), Some(Shape::Field(_))) {
+            return Err("connectDynamic -f: not a field.".into());
+        }
+        self.checkpoint();
+        if let Some(Shape::Field(f)) = self.scene.node_mut(field).map(|n| &mut n.shape) {
+            f.targets.retain(|t| *t != target);
+            if !remove {
+                f.targets.push(target);
+            }
+        }
+        Ok(())
+    }
+
+    /// Dynamics objects (particles, cloth, hair) among the selection.
+    pub fn selected_dynamics(&self) -> Vec<NodeId> {
+        self.sel.iter().copied().filter(|i| self.scene.node(*i).is_some_and(|n| matches!(n.shape, Shape::Particles(_) | Shape::Hair(_)) || n.cloth.is_some())).collect()
+    }
+
     /// Add (or remove) a passive collider for particles / cloth.
     pub fn connect_collider(&mut self, collider: NodeId, target: NodeId, remove: bool) -> Result<(), String> {
         if !remove && self.scene.node(collider).and_then(|n| n.mesh()).is_none() {
@@ -1149,8 +1560,9 @@ impl App {
         let n = self.scene.node_mut(target).ok_or("connectDynamic: no such target")?;
         let list = match (&mut n.shape, &mut n.cloth) {
             (Shape::Particles(p), _) => &mut p.settings.colliders,
+            (Shape::Hair(h), _) => &mut h.settings.colliders,
             (_, Some(c)) => &mut c.settings.colliders,
-            _ => return Err("connectDynamic: the target must be a particle system or an nCloth mesh.".into()),
+            _ => return Err("connectDynamic: the target must be a particle system, an nCloth mesh or a hair system.".into()),
         };
         list.retain(|c| *c != collider);
         if !remove {
@@ -1169,12 +1581,14 @@ pub fn set_attr(app: &mut App, spec: &str, vals: &[f32]) -> Option<Result<(), St
     }
     let id = app.scene.find_by_name(node)?;
     let n = app.scene.node(id)?;
-    if !matches!(n.shape, Shape::Particles(_)) && n.cloth.is_none() {
+    if !matches!(n.shape, Shape::Particles(_) | Shape::Field(_) | Shape::Hair(_)) && n.cloth.is_none() {
         return None;
     }
     // Validate on a copy first so a bad attribute doesn't create an undo step.
     let r = match (&n.shape, &n.cloth) {
         (Shape::Particles(p), _) => p.settings.clone().set_attr(attr, vals),
+        (Shape::Field(f), _) => f.clone().set_attr(attr, vals),
+        (Shape::Hair(h), _) => h.settings.clone().set_attr(attr, vals),
         (_, Some(c)) => c.settings.clone().set_attr(attr, vals),
         _ => return None,
     };
@@ -1185,6 +1599,8 @@ pub fn set_attr(app: &mut App, spec: &str, vals: &[f32]) -> Option<Result<(), St
     let n = app.scene.node_mut(id).unwrap();
     Some(match (&mut n.shape, &mut n.cloth) {
         (Shape::Particles(p), _) => p.settings.set_attr(attr, vals),
+        (Shape::Field(f), _) => f.set_attr(attr, vals),
+        (Shape::Hair(h), _) => h.settings.set_attr(attr, vals),
         (_, Some(c)) => c.settings.set_attr(attr, vals),
         _ => Ok(()),
     })
@@ -1202,10 +1618,19 @@ pub fn get_attr(app: &App, spec: &str) -> Option<String> {
             "lifespan" => p.settings.lifespan.to_string(),
             _ => return None,
         }),
+        Shape::Field(f) => Some(match attr {
+            "magnitude" | "mag" => f.magnitude.to_string(),
+            "attenuation" => f.attenuation.to_string(),
+            "maxDistance" => f.max_distance.to_string(),
+            "type" => f.kind.name().to_string(),
+            _ => return None,
+        }),
+        Shape::Hair(h) => crate::hair::get_attr(h, attr),
         _ => n.cloth.as_ref().and_then(|c| match attr {
             "stretch" => Some(c.settings.stretch.to_string()),
             "bend" => Some(c.settings.bend.to_string()),
             "pins" => Some(c.settings.pins.len().to_string()),
+            "selfCollide" => Some((c.settings.self_collide as u8).to_string()),
             _ => None,
         }),
     }
@@ -1297,6 +1722,7 @@ pub fn mel(app: &mut App, tokens: &[String]) -> Option<Result<String, String>> {
             let stretch = numv(take_val(&mut t, &["stretch", "s"]));
             let bend = numv(take_val(&mut t, &["bend", "b"]));
             let thick = numv(take_val(&mut t, &["thickness", "th"]));
+            let self_col = take_flag(&mut t, &["selfCollide", "sc"]);
             let objs: Vec<String> = t.iter().filter(|x| !x.starts_with('-')).cloned().collect();
             let ids = crate::commands::targets(app, &objs)?;
             let n = app.create_cloth(&ids, |s| {
@@ -1308,6 +1734,9 @@ pub fn mel(app: &mut App, tokens: &[String]) -> Option<Result<String, String>> {
                 }
                 if let Some(v) = thick {
                     s.thickness = v.max(0.0);
+                }
+                if self_col {
+                    s.self_collide = true;
                 }
             })?;
             Ok(format!("{n} nCloth"))
@@ -1349,8 +1778,114 @@ pub fn mel(app: &mut App, tokens: &[String]) -> Option<Result<String, String>> {
             }
             Ok(format!("{total} pinned"))
         })(),
+        "field" | "airField" | "gravityField" | "uniformField" | "radialField" | "vortexField" | "turbulenceField" | "dragField" | "newtonField" => (|| {
+            let kind = if cmd == "field" {
+                let k = take_val(&mut t, &["type", "typ", "t"]).unwrap_or_else(|| "air".into());
+                FieldKind::parse(&k).ok_or(format!("field: unknown type '{k}' (air gravity uniform radial vortex turbulence drag newton)"))?
+            } else {
+                FieldKind::parse(cmd).unwrap()
+            };
+            let mut f = Field::new(kind);
+            if let Some(v) = numv(take_val(&mut t, &["m", "magnitude", "mag"])) {
+                f.magnitude = v;
+            }
+            if let Some(v) = numv(take_val(&mut t, &["att", "attenuation"])) {
+                f.attenuation = v.max(0.0);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["mxd", "maxDistance"])) {
+                f.max_distance = v.max(0.0);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["f", "frequency", "freq"])) {
+                f.frequency = v.max(0.0);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["s", "speed"])) {
+                f.speed = v.max(0.0);
+            }
+            if let Some(d) = take_vec(&mut t, &["dir", "direction", "axis"]) {
+                f.direction = d;
+            }
+            let (dx, dy, dz) = (numv(take_val(&mut t, &["dx"])), numv(take_val(&mut t, &["dy"])), numv(take_val(&mut t, &["dz"])));
+            if dx.is_some() || dy.is_some() || dz.is_some() {
+                f.direction = Vec3::new(dx.unwrap_or(0.0), dy.unwrap_or(0.0), dz.unwrap_or(0.0));
+            }
+            let at = take_vec(&mut t, &["p", "pos", "position"]);
+            let name = take_val(&mut t, &["n", "name"]);
+            let objs: Vec<String> = t.iter().filter(|x| !x.starts_with('-')).cloned().collect();
+            let targets = if objs.is_empty() { app.selected_dynamics() } else { crate::commands::resolve(app, &objs)? };
+            let id = app.create_field(f, at, name.as_deref(), targets)?;
+            Ok(name_of(app, id))
+        })(),
+        "hairSystem" | "createHair" => (|| {
+            let mut s = crate::hair::HairSettings { length: 0.0, width: 0.0, thickness: 0.0, ..Default::default() };
+            if let Some(v) = numv(take_val(&mut t, &["count", "c"])) {
+                s.count = (v as u32).clamp(1, 200_000);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["length", "len", "l"])) {
+                s.length = v.max(1e-4);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["lr", "lengthRandom"])) {
+                s.length_random = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["seg", "segments"])) {
+                s.segments = (v as u32).clamp(1, 64);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["curl"])) {
+                s.curl = v.clamp(0.0, 720.0);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["tilt"])) {
+                s.tilt = v.clamp(0.0, 90.0);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["stiff", "stiffness"])) {
+                s.stiffness = v.clamp(0.0, 1.0);
+            }
+            if let Some(v) = numv(take_val(&mut t, &["w", "width"])) {
+                s.width = v.max(1e-5);
+                s.tip_width = s.width * 0.25;
+            }
+            if let Some(c) = take_vec(&mut t, &["rgb", "color"]) {
+                s.color = c.to_array();
+                s.tip_color = (c * 1.4).min(Vec3::ONE).to_array();
+            }
+            if let Some(c) = take_vec(&mut t, &["tip", "tipColor"]) {
+                s.tip_color = c.to_array();
+            }
+            let name = take_val(&mut t, &["n", "name"]);
+            let objs: Vec<String> = t.iter().filter(|x| !x.starts_with('-')).cloned().collect();
+            let mesh = crate::commands::targets(app, &objs)?.into_iter().find(|i| app.scene.node(*i).is_some_and(|n| n.mesh().is_some())).ok_or("hairSystem: select a polygon mesh")?;
+            let id = app.create_hair(mesh, s, name.as_deref())?;
+            Ok(name_of(app, id))
+        })(),
+        "makeCurvesDynamic" | "makeDynamic" => (|| {
+            let pin_tip = take_flag(&mut t, &["pinTip", "pt", "both"]);
+            let name = take_val(&mut t, &["n", "name"]);
+            let objs: Vec<String> = t.iter().filter(|x| !x.starts_with('-')).cloned().collect();
+            let ids = crate::commands::targets(app, &objs)?;
+            let mut outs = Vec::new();
+            for id in ids {
+                let (_, out) = app.make_curve_dynamic(id, pin_tip, name.as_deref())?;
+                outs.push(name_of(app, out));
+            }
+            if outs.is_empty() {
+                return Err("makeCurvesDynamic: select curves".into());
+            }
+            Ok(outs.join(" "))
+        })(),
+        "hairToCurves" => (|| {
+            let objs: Vec<String> = t.iter().filter(|x| !x.starts_with('-')).cloned().collect();
+            let id = crate::commands::targets(app, &objs)?.first().copied().ok_or("hairToCurves hairSystem")?;
+            let g = app.hair_to_curves(id)?;
+            Ok(name_of(app, g))
+        })(),
         "connectDynamic" => (|| {
-            // connectDynamic -c collider target   |   connectDynamic -d collider target
+            // connectDynamic -c collider target | -d collider target | -f field target | -rf field target
+            if let Some(fname) = take_val(&mut t, &["f", "fields"]).map(|f| (f, false)).or_else(|| take_val(&mut t, &["rf", "removeField"]).map(|f| (f, true))) {
+                let objs: Vec<String> = t.iter().filter(|x| !x.starts_with('-')).cloned().collect();
+                let fid = app.scene.find_by_name(&fname.0).ok_or_else(|| format!("No object matches name: {}", fname.0))?;
+                for target in crate::commands::targets(app, &objs)? {
+                    app.connect_field(fid, target, fname.1)?;
+                }
+                return Ok(String::new());
+            }
             let col = take_val(&mut t, &["c", "collisions"]);
             let rm = take_val(&mut t, &["d", "delete"]);
             let objs: Vec<String> = t.iter().filter(|x| !x.starts_with('-')).cloned().collect();
@@ -1562,6 +2097,96 @@ mod tests {
         assert_eq!(parts(&app, "sparks").len(), before);
         assert_eq!(execute(&mut app, "getAttr sparks.count").unwrap(), before.to_string());
         assert!(execute(&mut app, "setAttr sparks.bogus 1").is_err());
+    }
+
+    #[test]
+    fn fields_push_particles_and_cloth() {
+        let mut app = App::new();
+        app.scene.nodes.clear();
+        app.scene.fps = 24.0;
+        // Weightless particles at rest: an air field carries them along +X at ~its speed.
+        execute(&mut app, "emitter -type omni -r 24 -spd 0 -lifespan 0 -n p; move 0 2 0 p; setAttr p.gravity 0 0 0; setAttr p.drag 0; setAttr p.ground 0").unwrap();
+        execute(&mut app, "select -cl; airField -m 3 -s 4 -n wind").unwrap();
+        assert_eq!(execute(&mut app, "getAttr wind.type").unwrap(), "air");
+        at(&mut app, 49.0);
+        let ps = parts(&app, "p");
+        let oldest = ps.iter().min_by_key(|q| q.id).unwrap();
+        assert!((oldest.v.x - 3.0).abs() < 0.2 && oldest.p.x > 3.0, "carried by the wind: v {} p {}", oldest.v, oldest.p);
+        // Restricting the field to another object stops it acting here.
+        execute(&mut app, "polyPlane -w 1 -h 1 -sx 4 -sy 4 -n rag; rotate 0 0 90 rag; move 0 3 0 rag; nCloth rag; connectDynamic -f wind rag").unwrap();
+        at(&mut app, 49.0);
+        let ps = parts(&app, "p");
+        assert!(ps.iter().all(|q| q.v.length() < 1e-4), "wind only acts on its target now");
+        // ...and the cloth (falling, unpinned) drifts +X with the wind.
+        let rid = app.scene.find_by_name("rag").unwrap();
+        let cx = wpts(&app, rid).iter().map(|p| p.x).sum::<f32>() / 25.0;
+        assert!(cx > 0.2, "cloth drifts with the air field: {cx}");
+        // A vortex swirls; radial pushes out; newton pulls in; gravity field adds weight.
+        execute(&mut app, "connectDynamic -rf wind rag; delete wind rag").unwrap();
+        execute(&mut app, "vortexField -m 4 -n vx p").unwrap();
+        at(&mut app, 25.0);
+        let ps = parts(&app, "p");
+        let q = ps.iter().min_by_key(|q| q.id).unwrap();
+        // Particle at (0,2,0) on the vortex axis line? the field sits at the origin with axis Y,
+        // so particles there are on the axis: no swirl. Move the field off-axis instead.
+        let _ = q;
+        execute(&mut app, "move 1 2 0 vx").unwrap();
+        at(&mut app, 25.0);
+        let ps = parts(&app, "p");
+        let q = ps.iter().min_by_key(|q| q.id).unwrap();
+        // r = p - c = (-1, 0, 0); Y × (-1,0,0) = (0,0,1): swirl toward +Z.
+        assert!(q.p.z > 0.3, "vortex swirls: {}", q.p);
+        execute(&mut app, "delete vx; radialField -m 5 -att 0 -p 0 1 0 -n blast").unwrap();
+        at(&mut app, 25.0);
+        let q = *parts(&app, "p").iter().min_by_key(|q| q.id).unwrap();
+        assert!(q.p.y > 2.5, "radial pushes away from (0,1,0): {}", q.p);
+        execute(&mut app, "setAttr blast.maxDistance 0.5").unwrap();
+        at(&mut app, 25.0);
+        let q = *parts(&app, "p").iter().min_by_key(|q| q.id).unwrap();
+        assert!((q.p.y - 2.0).abs() < 1e-3, "out of range: {}", q.p);
+        execute(&mut app, "delete blast; newtonField -m 3 -att 0 -p 0 0 0 -n pull; gravityField -m 2 -n g2").unwrap();
+        at(&mut app, 13.0);
+        let q = *parts(&app, "p").iter().min_by_key(|q| q.id).unwrap();
+        // Both pull down: (3 + 2) m/s² for 0.5 s ≈ 0.6 m.
+        assert!(q.p.y < 1.6 && q.p.y > 1.2, "newton + gravity: {}", q.p);
+        assert!(execute(&mut app, "field -type bogus").is_err());
+        assert!(execute(&mut app, "setAttr g2.nope 1").is_err());
+    }
+
+    #[test]
+    fn cloth_self_collision_keeps_layers_apart() {
+        let mut app = App::new();
+        app.scene.nodes.clear();
+        app.scene.fps = 24.0;
+        // A sheet crumpled by a strong attractor (no gravity) folds onto itself.
+        let drop = |app: &mut App, name: &str, extra: &str| -> f32 {
+            execute(app, &format!("polyPlane -w 2 -h 2 -sx 16 -sy 16 -n {name}; move 0 0.5 0 {name}; nCloth -th 0.005 {extra} {name}; setAttr {name}.gravity 0 0 0; setAttr {name}.drag 0.2; select -cl; newtonField -m 15 -att 0 -p 0 0.4 0 -n pull_{name} {name}")).unwrap();
+            at(app, 60.0);
+            let id = app.scene.find_by_name(name).unwrap();
+            let p = wpts(app, id);
+            let rest: Vec<Vec3> = {
+                let w = app.scene.world_matrix(id);
+                app.scene.node(id).unwrap().mesh().unwrap().positions.iter().map(|q| w.transform_point3(*q)).collect()
+            };
+            let ext = p.iter().map(|q| (q - Vec3::new(0.0, 0.4, 0.0)).length()).fold(0.0, f32::max);
+            let mut min = f32::MAX;
+            for i in 0..p.len() {
+                for j in i + 1..p.len() {
+                    if rest[i].distance(rest[j]) > 0.4 {
+                        min = min.min(p[i].distance(p[j]));
+                    }
+                }
+            }
+            eprintln!("{name}: crumpled to radius {ext:.3}");
+            execute(app, &format!("delete {name} pull_{name}")).unwrap();
+            min
+        };
+        let without = drop(&mut app, "a", "");
+        let with = drop(&mut app, "b", "-selfCollide");
+        eprintln!("closest far-apart vertices: without {without:.4}, with {with:.4}");
+        assert!(with > 0.08, "self collision keeps a gap: {with}");
+        assert!(without < 0.05, "without it the layers pass through each other: {without}");
+        assert!(with > without * 2.0, "{with} vs {without}");
     }
 
     /// `cargo test --release fx_perf -- --ignored --nocapture`

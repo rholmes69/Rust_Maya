@@ -1137,6 +1137,11 @@ impl App {
     }
 
     pub fn save_to(&mut self, path: PathBuf) {
+        self.scene.render_settings = Some(self.render.settings.clone());
+        self.scene.render_camera = match self.render.camera {
+            crate::render_view::RenderCam::Node(id) => self.scene.node(id).map(|n| n.name.clone()),
+            crate::render_view::RenderCam::ActiveView => None,
+        };
         match serde_json::to_string_pretty(&self.scene).map_err(|e| e.to_string()).and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string())) {
             Ok(()) => {
                 self.info(format!("Saved {}", path.display()));
@@ -1154,6 +1159,17 @@ impl App {
                 self.checkpoint();
                 self.scene = scene;
                 self.scene.evaluate();
+                if let Some(s) = self.scene.render_settings.clone() {
+                    self.render.settings = s;
+                }
+                self.render.camera = self
+                    .scene
+                    .render_camera
+                    .as_deref()
+                    .and_then(|n| self.scene.find_by_name(n))
+                    .filter(|&id| self.is_camera(id))
+                    .map(crate::render_view::RenderCam::Node)
+                    .unwrap_or(crate::render_view::RenderCam::ActiveView);
                 self.sel.clear();
                 self.comp_sel.clear();
                 self.comp_mode = CompMode::Object;
@@ -1450,6 +1466,10 @@ impl App {
                 (ps.cache.version, ps.cache.current, ps.cache.key).hash(&mut h);
                 format!("{:?}", ps.settings).hash(&mut h);
             }
+            Shape::Hair(hs) => {
+                (hs.cache.version, hs.cache.current, hs.cache.key).hash(&mut h);
+                format!("{:?}", hs.settings).hash(&mut h);
+            }
             other => format!("{other:?}").hash(&mut h),
         }
         if let Some(m) = n.material.and_then(|m| self.material(m)) {
@@ -1594,6 +1614,35 @@ impl App {
                         let vert = GpuVertex::line(v, c);
                         extra_wire.push(vert);
                     }
+                }
+                continue;
+            }
+            if let Shape::Field(f) = &node.shape {
+                let c = if selected { wire_col } else { [0.55, 0.9, 0.8] };
+                for (a, b) in crate::fx::field_icon(f) {
+                    extra_wire.push(GpuVertex::line(w.transform_point3(a), c));
+                    extra_wire.push(GpuVertex::line(w.transform_point3(b), c));
+                }
+                continue;
+            }
+            if let Shape::Hair(hs) = &node.shape {
+                if selected {
+                    for st in hs.strands().iter().take(600) {
+                        for seg in st.windows(2) {
+                            extra_wire.push(GpuVertex::line(seg[0], wire_col));
+                            extra_wire.push(GpuVertex::line(seg[1], wire_col));
+                        }
+                    }
+                }
+                let tris = crate::hair::hair_tris(hs);
+                if !tris.is_empty() {
+                    let lo = tris.iter().fold(Vec3::splat(f32::MAX), |a, t| a.min(t.0));
+                    let hi = tris.iter().fold(Vec3::splat(f32::MIN), |a, t| a.max(t.0));
+                    let verts: Vec<GpuVertex> = tris
+                        .iter()
+                        .map(|(p, n, col)| GpuVertex { pos: p.to_array(), nrm: n.to_array(), col: [col[0], col[1], col[2], 1.0], mat: GpuVertex::DEFAULT_MAT, emi: [0.0; 4], uv: [0.0; 2], maps: [0.0; 4] })
+                        .collect();
+                    g.tris.push(Chunk::with_bounds(verts, Some((lo, hi))));
                 }
                 continue;
             }

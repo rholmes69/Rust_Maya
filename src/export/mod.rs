@@ -22,11 +22,14 @@ pub struct ExportOptions {
     /// USD: export skinned meshes as UsdSkel (Skeleton + SkelAnimation + joint weights)
     /// instead of baked point samples.
     pub usd_skel: bool,
+    /// FBX: fold joint orients into the rotation (no PreRotation), for tools that handle
+    /// pre-rotations poorly.
+    pub fbx_bake_orient: bool,
 }
 
 impl ExportOptions {
     pub fn from_app(app: &App, selected_only: bool) -> Self {
-        ExportOptions { selected_only, animation: true, start: app.scene.play_start, end: app.scene.play_end, bake_deformation: true, out_path: None, usd_skel: !app.usd_bake_points }
+        ExportOptions { selected_only, animation: true, start: app.scene.play_start, end: app.scene.play_end, bake_deformation: true, out_path: None, usd_skel: !app.usd_bake_points, fbx_bake_orient: false }
     }
 }
 
@@ -88,6 +91,10 @@ pub struct Baked {
     pub points: HashMap<NodeId, Vec<Vec<Vec3>>>,
     /// Object-space particle positions per frame (particle systems).
     pub particles: HashMap<NodeId, Vec<Vec<Vec3>>>,
+    /// Particle ids matching `particles` (stable per particle across frames).
+    pub particle_ids: HashMap<NodeId, Vec<Vec<u32>>>,
+    /// Object-space hair strand points per frame (all strands, `segments + 1` points each).
+    pub hair: HashMap<NodeId, Vec<Vec<Vec3>>>,
 }
 
 impl Baked {
@@ -100,7 +107,7 @@ impl Baked {
                 f += 1.0;
             }
         }
-        let mut b = Baked { frames, trs: HashMap::new(), weights: HashMap::new(), points: HashMap::new(), particles: HashMap::new() };
+        let mut b = Baked { frames, trs: HashMap::new(), weights: HashMap::new(), points: HashMap::new(), particles: HashMap::new(), particle_ids: HashMap::new(), hair: HashMap::new() };
         if b.frames.len() < 2 {
             b.frames.clear();
             return b;
@@ -119,6 +126,11 @@ impl Baked {
                 if let crate::scene::Shape::Particles(ps) = &n.shape {
                     let inv = sc.world_matrix(id).inverse();
                     b.particles.entry(id).or_default().push(ps.current().iter().map(|q| inv.transform_point3(q.p)).collect());
+                    b.particle_ids.entry(id).or_default().push(ps.current().iter().map(|q| q.id).collect());
+                }
+                if let crate::scene::Shape::Hair(h) = &n.shape {
+                    let inv = sc.world_matrix(id).inverse();
+                    b.hair.entry(id).or_default().push(h.current().unwrap_or(&[]).iter().map(|p| inv.transform_point3(*p)).collect());
                 }
                 if with_points && crate::rig::has_deformers(&sc, id) {
                     let world = crate::rig::deformed_positions(&sc, id).unwrap_or_default();
@@ -131,6 +143,7 @@ impl Baked {
         b.trs.retain(|_, v| v.windows(2).any(|w| w[0].0.distance(w[1].0) > 1e-5 || w[0].1.angle_between(w[1].1) > 1e-5 || w[0].2.distance(w[1].2) > 1e-5));
         b.weights.retain(|_, v| v.windows(2).any(|w| w[0].iter().zip(&w[1]).any(|(a, c)| (a - c).abs() > 1e-6)));
         b.points.retain(|_, v| v.windows(2).any(|w| w[0].iter().zip(&w[1]).any(|(a, c)| a.distance(*c) > 1e-6)));
+        b.hair.retain(|_, v| v.windows(2).any(|w| w[0].len() != w[1].len() || w[0].iter().zip(&w[1]).any(|(a, c)| a.distance(*c) > 1e-6)));
         b
     }
 }
@@ -148,7 +161,8 @@ pub fn export_path(app: &App, path: &std::path::Path, opts: &ExportOptions) -> R
         "glb" => gltf::export(app, opts)?,
         "gltf" => gltf::export_embedded(app, opts)?,
         "usda" | "usd" => usd::export(app, opts)?,
-        _ => return Err(format!("Unknown export format '.{ext}' (use .glb, .gltf or .usda)")),
+        "fbx" => crate::fbx::export::export(app, opts)?,
+        _ => return Err(format!("Unknown export format '.{ext}' (use .fbx, .glb, .gltf or .usda)")),
     };
     std::fs::write(path, &bytes).map_err(|e| e.to_string())?;
     Ok(format!("{summary} → {} ({:.1} KB)", path.display(), bytes.len() as f64 / 1024.0))

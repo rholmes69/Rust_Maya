@@ -57,6 +57,8 @@ pub struct Copilot {
     hist_cursor: Option<usize>,
     busy: bool,
     busy_task: Option<Task>,
+    /// Offline makeShot draft kept while a model refines the shot.
+    pending_shot: Option<String>,
     current: Option<usize>,
     route_note: String,
     ollama: Result<Vec<ModelInfo>, String>,
@@ -178,6 +180,7 @@ impl Copilot {
             hist_cursor: None,
             busy: false,
             busy_task: None,
+            pending_shot: None,
             current: None,
             route_note: String::new(),
             ollama: Err("not checked yet".into()),
@@ -323,10 +326,19 @@ impl Copilot {
         self.hist_cursor = None;
         self.entries.push(Entry::new(Role::User, &prompt));
         self.open = true;
+        // A whole shot: a model refines the offline draft when one is available.
+        if crate::director::is_shot_request(&prompt) {
+            self.make_shot(app, &prompt);
+            return;
+        }
         // 1) Instant offline parser (no model needed).
         let parsed = parse_simple(&prompt);
         if parsed.as_deref() == Some(&["renderCheck".to_string()][..]) {
             self.render_check(app);
+            return;
+        }
+        if parsed.as_deref() == Some(&["rigReport".to_string()][..]) {
+            self.explain_rig(app);
             return;
         }
         if let Some(mel) = parsed {
@@ -379,6 +391,62 @@ impl Copilot {
         self.current = Some(self.entries.len() - 1);
         self.busy = true;
         app.begin_batch();
+    }
+
+    /// "Make a shot of …": build it from the offline draft, or let a model refine the draft first.
+    pub fn make_shot(&mut self, app: &mut App, prompt: &str) {
+        self.open = true;
+        let draft = crate::director::shot_mel(&crate::director::parse_shot(prompt));
+        match self.helper().filter(|_| self.busy_task.is_none()) {
+            Some(model) => {
+                let mut e = Entry::new(Role::Assistant, format!("🎬 Planning the shot with {}…", model.model));
+                e.meta = format!("offline draft: {draft}");
+                self.entries.push(e);
+                self.pending_shot = Some(draft.clone());
+                self.run_task(app, Task::MakeShot, format!("Shot description: {prompt}\nOffline draft: {draft}"));
+            }
+            None => self.build_shot(app, vec![draft], String::new(), "make a shot · offline director".into()),
+        }
+    }
+
+    /// Run the shot statements as one undo step, then render-check the result.
+    fn build_shot(&mut self, app: &mut App, mel: Vec<String>, reply: String, meta: String) {
+        let mut e = Entry::new(Role::Assistant, "");
+        e.meta = meta;
+        let mut notes = Vec::new();
+        app.begin_batch();
+        for m in &mel {
+            match crate::commands::execute(app, m) {
+                Ok(r) if m.trim_start().starts_with("makeShot") && !r.is_empty() => notes.push(r),
+                Ok(_) => {}
+                Err(err) => {
+                    app.log.push(format!("// Error: {err}"));
+                    e.errors.push(format!("{m}: {err}"));
+                }
+            }
+        }
+        app.end_batch();
+        e.text = format!("🎬 {}", if reply.is_empty() { notes.join("\n") } else if notes.is_empty() { reply } else { format!("{reply}\n{}", notes.join("\n")) });
+        e.mel = mel;
+        if self.settings.speak_replies {
+            self.speaker.speak(&e.text);
+        }
+        self.entries.push(e);
+        self.render_check(app);
+    }
+
+    /// Explain the rig: the automatic report (with fixes) at once, then a model's explanation.
+    pub fn explain_rig(&mut self, app: &mut App) {
+        self.open = true;
+        let r = app.rig_report();
+        let text = r.text();
+        let mut e = Entry::new(Role::Assistant, format!("🦴 {text}"));
+        e.meta = "rig report · automatic analysis".into();
+        e.suggested = r.fixes.clone();
+        self.entries.push(e);
+        if r.joints > 0 && self.helper().is_some() && self.busy_task.is_none() {
+            self.run_task(app, Task::ExplainRig, format!("Explain my rig.\nAutomatic rig report:\n{text}"));
+        }
     }
 
     pub fn run_task(&mut self, app: &App, task: Task, prompt: String) {
@@ -504,9 +572,11 @@ impl Copilot {
                 }
                 AiEvent::Error(e) => {
                     if let Some(t) = self.busy_task.filter(|t| !self.busy || e.starts_with(t.label())) {
-                        let _ = t;
                         self.busy_task = None;
                         self.entries.push(Entry::new(Role::System, e));
+                        if t == Task::MakeShot && let Some(draft) = self.pending_shot.take() {
+                            self.build_shot(app, vec![draft], String::new(), "make a shot · offline draft (model failed)".into());
+                        }
                         continue;
                     }
                     app.end_batch();
@@ -526,6 +596,12 @@ impl Copilot {
     }
 
     fn task_done(&mut self, app: &mut App, task: Task, reply: String, mel: Vec<String>, meta: String) {
+        if task == Task::MakeShot {
+            let draft = self.pending_shot.take();
+            let mel = if mel.is_empty() { draft.into_iter().collect() } else { mel };
+            self.build_shot(app, mel, reply, meta);
+            return;
+        }
         let mut e = Entry::new(Role::Assistant, reply.clone());
         e.meta = meta;
         match task {
@@ -557,6 +633,11 @@ impl Copilot {
                 e.text = format!("🔍 {reply}");
                 e.suggested = mel;
             }
+            Task::ExplainRig => {
+                e.text = format!("🦴 {reply}");
+                e.suggested = mel;
+            }
+            Task::MakeShot => {}
         }
         if self.settings.speak_replies {
             self.speaker.speak(&e.text);
@@ -800,6 +881,14 @@ impl Copilot {
             }
             if ui.small_button("Color selected…").clicked() {
                 self.palette_open = true;
+            }
+            if ui.small_button("🎬 Make a shot").on_hover_text("Describe a shot: set, character, action, mood, camera, FX — built in one step").clicked() {
+                self.input = "Make a shot of ".into();
+                self.focus_input = true;
+            }
+            if ui.small_button("🦴 Explain rig").on_hover_text("Explain how the rig works and find problems (with fixes)").clicked() {
+                self.entries.push(Entry::new(Role::User, "Explain my rig"));
+                self.explain_rig(app);
             }
             if ui.small_button("Bounce selected").clicked() {
                 self.submit(app, "Animate the selected object bouncing three times over 72 frames, then play.".into());

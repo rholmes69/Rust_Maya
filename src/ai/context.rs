@@ -46,6 +46,23 @@ pub fn scene_summary(app: &App) -> String {
                 let src = st.source.and_then(|i| sc.node(i)).map(|x| format!(" from {}", x.name)).unwrap_or_default();
                 format!("particle system ({} emitter{src}, rate {:.0}/s, speed {:.2}, lifespan {:.1}s, {} live particles)", st.kind.name(), st.rate, st.speed, st.lifespan, ps.current().len())
             }
+            Shape::Field(f) => format!(
+                "{} field (magnitude {:.2}, attenuation {:.1}{}, acts on {})",
+                f.kind.name(),
+                f.magnitude,
+                f.attenuation,
+                if f.max_distance > 0.0 { format!(", max distance {:.2}", f.max_distance) } else { String::new() },
+                if f.targets.is_empty() { "all simulations".to_string() } else { f.targets.iter().filter_map(|i| sc.node(*i)).map(|n| n.name.clone()).collect::<Vec<_>>().join(", ") }
+            ),
+            Shape::Hair(h) => {
+                let st = &h.settings;
+                let src = st.source.and_then(|i| sc.node(i)).map(|x| x.name.clone()).unwrap_or_else(|| "?".into());
+                if st.output.is_some() {
+                    format!("dynamic curve (from {src}{}, stiffness {:.2})", if st.pin_tip { ", both ends pinned" } else { "" }, st.stiffness)
+                } else {
+                    format!("hair system ({} strands on {src}, length {:.2}, {} segments, stiffness {:.2})", st.count, st.length, st.segments, st.stiffness)
+                }
+            }
             Shape::Group => "group".to_string(),
             Shape::Locator => "locator".to_string(),
             Shape::Joint { .. } => format!("joint (orient {})", v3(n.joint_orient)),
@@ -236,6 +253,8 @@ fn shape_kind(s: &Shape) -> &'static str {
         Shape::Camera(_) => "camera",
         Shape::Lattice { .. } => "lattice",
         Shape::Particles(_) => "particles",
+        Shape::Field(_) => "field",
+        Shape::Hair(_) => "hair",
         Shape::Curve { .. } => "curve",
         Shape::Poly { history: Some(p), .. } => p.base_name(),
         Shape::Poly { .. } => "mesh",

@@ -30,6 +30,77 @@ fn make_collide(app: &mut App, remove: bool) {
     super::report(app, r);
 }
 
+fn add_field(app: &mut App, kind: crate::fx::FieldKind) {
+    let targets = app.selected_dynamics();
+    let n = targets.len();
+    let r = app.create_field(crate::fx::Field::new(kind), None, None, targets).map(|id| {
+        let name = app.scene.node(id).map(|n| n.name.clone()).unwrap_or_default();
+        if n == 0 { format!("Created {name} (acts on every simulation)") } else { format!("Created {name} (acts on the {n} selected simulation(s))") }
+    });
+    super::report(app, r);
+}
+
+fn fields_menu(app: &mut App, ui: &mut egui::Ui) {
+    use crate::fx::FieldKind as F;
+    for (k, label, tip) in [
+        (F::Air, "Air", "wind: carries things along"),
+        (F::Drag, "Drag", "slows things down"),
+        (F::Gravity, "Gravity", "extra weight"),
+        (F::Newton, "Newton", "attracts to a point"),
+        (F::Radial, "Radial", "pushes away from a point"),
+        (F::Turbulence, "Turbulence", "noise"),
+        (F::Uniform, "Uniform", "constant push"),
+        (F::Vortex, "Vortex", "swirls around an axis"),
+    ] {
+        if item(ui, label, tip) {
+            add_field(app, k);
+        }
+    }
+    ui.separator();
+    if item(ui, "Affect Selected Object(s)", "field, then targets") {
+        let sel = app.sel.clone();
+        let field = sel.iter().copied().find(|i| matches!(app.scene.node(*i).map(|n| &n.shape), Some(crate::scene::Shape::Field(_))));
+        let r = match field {
+            Some(f) => sel.iter().filter(|i| **i != f).try_for_each(|t| app.connect_field(f, *t, false)).map(|_| "Field connected".to_string()),
+            None => Err("Select a field and the simulations it should affect.".into()),
+        };
+        super::report(app, r);
+    }
+    ui.label(egui::RichText::new("A field with no targets acts on every particle system, cloth and hair. Move / rotate it to place and aim it.").weak().small());
+}
+
+fn hair_menu(app: &mut App, ui: &mut egui::Ui) {
+    let sel = app.sel.clone();
+    if item(ui, "Create Hair", "on the selected mesh") {
+        let mesh = sel.iter().copied().find(|i| app.scene.node(*i).is_some_and(|n| n.mesh().is_some()));
+        let r = match mesh {
+            Some(m) => app.create_hair(m, crate::hair::HairSettings { length: 0.0, width: 0.0, thickness: 0.0, ..Default::default() }, None).map(|_| "Hair created (play the timeline; style it in the Attribute Editor)".to_string()),
+            None => Err("Select a polygon mesh to grow hair from.".into()),
+        };
+        super::report(app, r);
+    }
+    if item(ui, "Make Selected Curves Dynamic", "") {
+        let curves: Vec<_> = sel.iter().copied().filter(|i| matches!(app.scene.node(*i).map(|n| &n.shape), Some(crate::scene::Shape::Curve { .. }))).collect();
+        let r = if curves.is_empty() {
+            Err("Select curves first.".to_string())
+        } else {
+            curves.iter().try_for_each(|c| app.make_curve_dynamic(*c, false, None).map(|_| ())).map(|_| format!("{} dynamic curve(s): the *_dyn curves follow the simulation", curves.len()))
+        };
+        super::report(app, r);
+    }
+    if item(ui, "Convert Hair to Curves", "") {
+        let r = match sel.first() {
+            Some(id) => app.hair_to_curves(*id).map(|_| "Curves created".to_string()),
+            None => Err("Select a hair system.".into()),
+        };
+        super::report(app, r);
+    }
+    ui.separator();
+    if item(ui, "Make Collide", "colliders, then hair") {
+        make_collide(app, false);
+    }
+}
+
 fn particles_menu(app: &mut App, ui: &mut egui::Ui) {
     use crate::fx::EmitterKind as K;
     if item(ui, "Create Emitter", "omni") {
@@ -225,7 +296,7 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
                 }
             });
             ui.separator();
-            if item(ui, "Import (glTF / USD / OBJ)...", "") {
+            if item(ui, "Import (FBX / glTF / USD / OBJ)...", "") {
                 actions.push(Action::ImportObj);
             }
             if item(ui, "Export All (OBJ)...", "") {
@@ -234,10 +305,10 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             if item(ui, "Export Selection (OBJ)...", "") {
                 actions.push(Action::ExportObj(true));
             }
-            if item(ui, "Export All (glTF / USD)...", "") {
+            if item(ui, "Export All (glTF / FBX / USD)...", "") {
                 actions.push(Action::Export(false));
             }
-            if item(ui, "Export Selection (glTF / USD)...", "") {
+            if item(ui, "Export Selection (glTF / FBX / USD)...", "") {
                 actions.push(Action::Export(true));
             }
             ui.checkbox(&mut app.usd_bake_points, "USD: bake skinning to points (instead of UsdSkel)");
@@ -429,7 +500,9 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
             MenuSet::Fx => {
                 ui.menu_button("nParticles", |ui| particles_menu(app, ui));
                 ui.menu_button("nCloth", |ui| cloth_menu(app, ui));
-                for m in ["Fluids", "nHair", "Fields/Solvers", "Effects", "Bifrost Fluids"] {
+                ui.menu_button("nHair", |ui| hair_menu(app, ui));
+                ui.menu_button("Fields/Solvers", |ui| fields_menu(app, ui));
+                for m in ["Fluids", "Effects", "Bifrost Fluids"] {
                     ui.menu_button(m, |ui| planned(ui, "Not available in this build"));
                 }
             }
@@ -502,7 +575,17 @@ fn modeling_menus(app: &mut App, ui: &mut egui::Ui) {
             let r = app.merge_selected(Some(d));
             super::report(app, r);
         }
-        planned(ui, "Reduce");
+        ui.horizontal(|ui| {
+            let id = egui::Id::unique("reduce_percent");
+            let mut pct: f32 = ui.data_mut(|d| *d.get_temp_mut_or(id, 50.0));
+            if ui.button("Reduce").on_hover_text("Remove this percentage of the triangles (quadric decimation; keeps borders, UV seams, skin weights)").clicked() {
+                let sel = app.sel.clone();
+                let r = app.reduce_meshes(&sel, 100.0 - pct, true);
+                super::report(app, r);
+            }
+            ui.add(egui::DragValue::new(&mut pct).range(1.0..=99.0).suffix(" %"));
+            ui.data_mut(|d| d.insert_temp(id, pct));
+        });
     });
     ui.menu_button("Edit Mesh", |ui| {
         if item(ui, "Extrude", "Ctrl+E") {
@@ -559,8 +642,25 @@ fn modeling_menus(app: &mut App, ui: &mut egui::Ui) {
         if ui.button("Reverse (normals)").clicked() {
             app.reverse_normals();
         }
-        planned(ui, "Soften Edge");
-        planned(ui, "Harden Edge");
+        let sel = app.sel.clone();
+        if item(ui, "Soften Edge", "selected edges, or meshes") {
+            let r = app.soft_edge(&sel, 180.0).map(|n| format!("Softened {n} edges"));
+            super::report(app, r);
+        }
+        if item(ui, "Harden Edge", "") {
+            let r = app.soft_edge(&sel, 0.0).map(|n| format!("Hardened {n} edges"));
+            super::report(app, r);
+        }
+        ui.horizontal(|ui| {
+            let id = egui::Id::unique("normal_angle");
+            let mut a: f32 = ui.data_mut(|d| *d.get_temp_mut_or(id, 30.0));
+            if ui.button("Set Normal Angle").on_hover_text("Edges whose faces meet at more than this angle become hard").clicked() {
+                let r = app.soft_edge(&sel, a).map(|n| format!("Normal angle {a}° on {n} edges"));
+                super::report(app, r);
+            }
+            ui.add(egui::DragValue::new(&mut a).range(0.0..=180.0).suffix("°"));
+            ui.data_mut(|d| d.insert_temp(id, a));
+        });
     });
     ui.menu_button("Curves", |ui| curves_menu(app, ui));
     ui.menu_button("Surfaces", |ui| surfaces_menu(app, ui));
@@ -1294,9 +1394,29 @@ pub fn shelf(app: &mut App, ui: &mut egui::Ui) {
                 if shelf_button(ui, "Collide", acc, "Colliders, then the particles / cloth", app.sel.len() >= 2) {
                     make_collide(app, false);
                 }
-                for n in ["Fluid", "Field"] {
-                    shelf_button(ui, n, Color32::from_rgb(150, 150, 150), n, false);
+                if shelf_button(ui, "Air", acc, "Air (wind) field — acts on the selected simulations, or all", true) {
+                    add_field(app, crate::fx::FieldKind::Air);
                 }
+                if shelf_button(ui, "Turb", acc, "Turbulence field", true) {
+                    add_field(app, crate::fx::FieldKind::Turbulence);
+                }
+                if shelf_button(ui, "Vortex", acc, "Vortex field", true) {
+                    add_field(app, crate::fx::FieldKind::Vortex);
+                }
+                if shelf_button(ui, "Hair", acc, "Grow hair on the selected mesh", app.lead().is_some()) {
+                    let mesh = app.sel.iter().copied().find(|i| app.scene.node(*i).is_some_and(|n| n.mesh().is_some()));
+                    let r = match mesh {
+                        Some(m) => app.create_hair(m, crate::hair::HairSettings { length: 0.0, width: 0.0, thickness: 0.0, ..Default::default() }, None).map(|_| String::new()),
+                        None => Err("Select a polygon mesh.".into()),
+                    };
+                    super::report(app, r);
+                }
+                if shelf_button(ui, "DynCrv", acc, "Make the selected curves dynamic", app.lead().is_some()) {
+                    let sel = app.sel.clone();
+                    let r = sel.iter().try_for_each(|c| app.make_curve_dynamic(*c, false, None).map(|_| ())).map(|_| String::new());
+                    super::report(app, r);
+                }
+                shelf_button(ui, "Fluid", Color32::from_rgb(150, 150, 150), "Fluid", false);
             }
             _ => {
                 let names: &[&str] = &["Network", "Distrib", "Repro"];

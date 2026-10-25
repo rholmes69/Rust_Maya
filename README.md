@@ -158,7 +158,7 @@ Not exported: cluster deformers in glTF (glTF has no equivalent), ambient lights
 
 ![import](docs/import.png)
 
-File › Import (glTF / USD / OBJ)…, drag and drop a file onto the window, or `file -import path [-take animName]`:
+File › Import (FBX / glTF / USD / OBJ)…, drag and drop a file onto the window, or `file -import path [-take animName]`:
 
 | Format | What comes in |
 |---|---|
@@ -168,6 +168,22 @@ File › Import (glTF / USD / OBJ)…, drag and drop a file onto the window, or 
 
 Normal and metallic-roughness maps have been imported since v1.4, with the packed glTF texture split into roughness and metalness maps; occlusion and emissive maps since v1.5. Orthographic cameras are not imported yet.
 Tested against the Khronos sample models CesiumMan, Fox (3 takes), RiggedFigure, AnimatedMorphCube, BoxAnimated, BoxTextured and DamagedHelmet, and with Rust Maya's own glTF round-trip (rig, skin, blend shape, animation, texture, light, camera).
+
+### FBX import and export (v2.1)
+
+`file -import character.fbx [-take Run]`, `file -export scene.fbx [-es] [-na] [-bo]`, File › Import / Export, or drag and drop.
+
+| | |
+|---|---|
+| **Import** (FBX 2011 and newer, binary including 7.5's 64-bit offsets and zlib arrays, and ASCII) | The model hierarchy. Pre-rotations become joint orients. Pivots, offsets, post-rotations and rotation orders are baked into the transforms. Geometric transforms are applied to the mesh points. Units are converted to metres and Z-up files to Y-up. Meshes keep their file vertex order, UVs and hard edges (from edge or polygon smoothing groups, or from the authored normals); faces with several materials are split into one sub-mesh per material. Materials come in with diffuse, emissive, transparency and shininess, plus colour, normal and emissive textures (external, or embedded and extracted to `<file>.fbm/`). Also: skin clusters with exact bind matrices, blend shapes, cameras and lights, and animation stacks (`-take`). Curves map onto keyframes (step / linear / spline); transforms with pivots or other rotation orders are baked per frame. |
+| **Export** (binary FBX 7.4, metres, Y up) | Hierarchy (joints as LimbNodes, joint orient as PreRotation, or folded into the rotation with `-bo`), meshes with per-corner normals, edge smoothing (hard edges), UVs and a material, Phong materials with texture file links, skin clusters + bind pose, blend shapes, cameras, lights, and animation sampled every frame (transforms and blend-shape weights). |
+
+Checked against the 48 FBX test files that ship with the Open Asset Import Library (assimp). 47 load; the 48th is malformed and assimp rejects it too. For 38 of them the triangle counts match assimp exactly. The other 9 differ only where assimp merges instanced or same-named meshes, turns collinear polygons into lines, or cuts concave polygons differently. Bounds match assimp after unit conversion. Exported files load in assimp, and a rigged, animated Quick Rig character read back through assimp matches the original to within a millimetre. Rust Maya's own FBX round trip reproduces skinned and blend-shaped positions on every frame. FBX 6 (pre-2011) files and NURBS curves in FBX aren't supported.
+
+### Mesh › Reduce and Soften / Harden Edge (v2.1)
+
+- **Reduce** (`polyReduce -p 75 mesh` removes 75 % of the triangles): quadric-error edge collapses that keep borders, UV seams, skin weights and blend shapes, and never flip faces.
+- **Soften Edge / Harden Edge / Set Normal Angle** (Mesh Display menu, or `polySoftEdge -a 180|0|angle mesh` or `mesh.e[...]`): sets the soft and hard edges that drive the vertex normals in the viewport, renders and exports (glTF, USD, FBX). Hard edges are saved with the scene.
 
 ### USD import (v1.6)
 
@@ -265,6 +281,27 @@ MEL: `emitter -type omni|dir|surface|curve|volume -r 200 -spd 3 -sp 20 -dir 0 1 
 Speed on the 2-core test VM: a 41×41 cloth draped on a sphere simulates at about 39 ms/frame, and a 2,000 particles/s
 fountain (≈6,000 alive) with turbulence and a collider at about 3 ms/frame.
 
+### Fields, hair, dynamic curves and cloth self-collision (v2.0)
+
+![A hairy ball and a flag in an air field, particles in a vortex, and a dynamic rope pinned at both ends (path-traced)](docs/fx2.png)
+
+| | |
+|---|---|
+| **Fields** (FX › Fields/Solvers, or the Air / Turb / Vortex shelf buttons) | **Air** (wind velocity plus how fast things reach it), **Gravity**, **Uniform**, **Radial**, **Vortex**, **Turbulence**, **Drag** and **Newton** (attractor). Fields are scene nodes: move, rotate, key or constrain them to place and aim them. Each has magnitude, direction or axis, attenuation (falloff with distance) and max distance. A field acts on the simulations that were selected when it was created, or on every particle system, cloth and hair if none were. **Affect Selected Object(s)** and `connectDynamic -f` / `-rf` change its targets. Cloth feels air fields through its aerodynamic model, so flags flap instead of sliding. |
+| **nHair** | **Create Hair** grows strands from random points of a mesh. Settings: count, length (± random), segments, tilt, curl and comb direction / amount. The roots ride the deforming mesh, so hair follows a skinned head. Strands are simulated with follow-the-leader constraints and the DFTL velocity correction, which keeps them inextensible and rope-like. Further controls: a stiffness ramp from root to tip that pulls toward the styled shape, gravity, drag and wind, fields, and collisions with the growth mesh, other colliders and the ground. Hair draws as tapered tubes with a root-to-tip colour, in the viewport and in the path tracer. **Convert Hair to Curves** bakes the current strands into NURBS curves. |
+| **Dynamic curves** | **Make Selected Curves Dynamic** turns a curve into a one-strand hair system pinned at its start, or at both ends with `-pinTip`. The simulation writes into a new `<curve>_dyn` curve, which other tools can use as input, such as wire deformers or extrude and loft surfaces. |
+| **Cloth self-collision** | **Self collision** in the nCloth attributes, or `nCloth -selfCollide`, keeps folds from passing through each other. It works by repelling vertices with a spatial hash; neighbours at rest are skipped. The radius defaults to 45 % of the average edge length. |
+| **Export** | **glTF:** cloth and other point deformers (clusters, lattices, wraps, wires) bake to one morph target per frame, with one-hot weight animation (up to 300 targets; longer ranges are sampled evenly). Hair becomes a LINES mesh with the same per-frame morph targets. Particles become child nodes, one per particle slot, sharing an octahedron mesh, with animated translation and STEP-animated scale for birth and death. The Khronos glTF validator reports no errors. **USD:** hair writes `BasisCurves` with `points.timeSamples`, tapered widths and colours; pxr's validators report no issues. |
+
+MEL: `airField -m 6 -dx 1 -dy 0 -dz 0 -s 2 -n wind flag fur`, `vortexField -m 4 -p 0 1 0`, `turbulenceField -m 3 -f 1`,
+`newtonField -m 5 -att 2`, `field -type radial`, `setAttr wind.maxDistance 5`, `connectDynamic -f wind cape`,
+`hairSystem -count 1500 -length 0.45 -seg 8 -curl 30 -stiff 0.15 -rgb 0.55 0.3 0.12 -n fur head`,
+`setAttr fur.comb 0 -1 -1; setAttr fur.combAmount 0.6`, `makeCurvesDynamic -pinTip rope`, `hairToCurves fur`,
+`nCloth -selfCollide cape`, `setAttr cape.selfThickness 0.02`.
+
+Speed on the 2-core test VM: 1,000 strands × 8 segments on a colliding sphere in a turbulence field simulate at about
+27 ms/frame.
+
 ## Rendering: path tracer and Render View (v1.1)
 
 Status line **🎬** (or Rendering › Render › Render Current Frame, the *Render* shelf button, or `render`) renders the active view — or any camera — with a built-in multi-threaded **CPU path tracer** into the **Render View** window. The image refines progressively; **IPR** re-renders automatically whenever geometry, materials, lights, the camera or the settings change (selection changes don't).
@@ -288,6 +325,23 @@ renderSettings -x 960 -y 540 -spp 64 -env 0.3 -exp 0.5 -tm filmic -bg env   rend
 ![Render View](docs/render_view.png)
 
 ![Depth of field focused on the torus (left) and the albedo / normal / depth / object-ID passes (right)](docs/render_passes.png)
+
+### Motion blur, light-path passes and batch rendering (v2.2)
+
+- **Motion blur:** tick *Motion blur* in the Render View (or `renderSettings -mb on -shutter 0.5`). The shutter is open for *Shutter* frames, centred on the current frame (0.5 = a 180° film shutter). The renderer samples the scene at shutter open and close and moves every triangle between the two per sample. Moving and rotating objects, deforming skinned characters, blend shapes and camera moves all blur. Simulations (particles, cloth, hair) are cached per whole frame, so they blur only with a shutter of 1 frame or more. A scene with nothing moving renders exactly as it does with motion blur off.
+- **Light-path passes:** the pass menu adds **Diffuse Direct, Diffuse Indirect, Specular** and **Emission**. Emission includes self-lit surfaces and sky seen directly. The four add up to the beauty before denoising. Each is estimated on its own: the first bounce picks either the diffuse or the specular lobe and weights it by that lobe alone. They are not denoised, so for compositing render with more samples.
+- **EXR:** a save path ending in `.exr` writes linear 32-bit float images (beauty with exposure applied and no tone mapping). The passes are written raw: normals as −1..1, depth as camera distance, object IDs as numbers.
+- **Batch renderer:** `rust_maya --render scene.rma` renders without opening a window, so it works on a headless server or VPS with no GPU or display. It uses the Render Settings and render camera saved in the scene, which are now stored in the .rma file. Without a saved camera it uses the first camera node. Command-line flags override any setting. Progress and an ETA print per frame. Exit codes: 0 = done, 1 = file or render error, 2 = bad arguments. On Windows, run it from a terminal and the output appears there. Run `rust_maya --help` for every option.
+
+```
+rust_maya --render shot.rma -s 1 -e 120 -o renders/shot.png                 (frames → shot.0001.png …)
+rust_maya --render shot.rma -f 48 -x 1920 -y 1080 -spp 256 -mb on -passes -o out/f48.exr
+rust_maya --render shot.rma -all -cam closeUp -shutter 0.5 -q               (playback range, quiet)
+rust_maya --render shot.rma -mel "hide hero" -o no_hero.png                (MEL before rendering)
+render -o C:/r/shot.exr -passes specular,emission                           (MEL: just some passes)
+```
+
+![Motion blur off / on with a 1-frame shutter, then the diffuse direct, diffuse indirect, specular and emission passes](docs/render22.png)
 
 ## Performance (v0.6)
 
@@ -368,6 +422,43 @@ The Copilot has four recipe buttons. The recipes also work offline, by typing or
 
 ![Render check](docs/ai_render_check.png)
 
+### Director, rig explainer and posing (v1.9)
+
+Three AI features that also work fully offline:
+
+- **🎬 Make a shot.** Describe a shot, e.g. "make a shot of a robot waving in a forest at sunset with fireflies, orbit camera". A keyword parser turns the description into one `makeShot` statement. When a model is connected, it gets that draft and refines it (theme, subject, action, mood, camera move, FX), then the shot is built in **one undo step**:
+  - a themed set (forest, city, desert, beach, studio, snow, space);
+  - a human, robot or alien character, Quick Rigged and animated;
+  - FX presets (rain, snow, sparks, fireflies, dust, leaves, cape, flag);
+  - a light rig matching the mood and path-tracer settings;
+  - an animated `shotCam` (static, track, dolly, orbit or crane) that the viewport looks through.
+
+  A render check then runs on the result. The building blocks are also commands of their own: `character`, `environment`, `shotCamera` and `fxPreset`.
+- **🦴 Explain rig.** `rigReport` describes the skeleton chains, IK handles (poles, drivers), controls and constraints, driven keys, skins, deformers, cloth and particles. It flags problems and lists a fix for each, offered as a button:
+  - unnormalised or missing weights (`skinPercent -normalize`);
+  - more than 4 influences, or unused influences;
+  - unoriented or scaled joints;
+  - IK chains with no pole vector;
+  - nodes that are keyed and also constrained;
+  - drivers that were deleted;
+  - left/right names without a mirror partner.
+
+  With a model connected, the report is also explained in plain language.
+- **Voice and typed posing.** Phrases like "raise both arms a lot, bend the right elbow 60 degrees and turn the head left", "look up", "crouch 10 cm", "step forward with the left foot and key it" or "lean back a bit" become `pose` commands with no model involved, so they work with Whisper voice too.
+  - On a Quick Rig, `pose` swings the hand and foot IK controls around the shoulder and hip, which keeps limb length. Elbow and knee bends use the law of cosines, and the head, chest and cog controls are rotated or moved.
+  - On FK skeletons it rotates the joints themselves, found by fuzzy names (`LeftArm`, `arm_l`, `L_shoulder`).
+  - On an animated rig the pose is keyed at the current frame so it sticks.
+
+```
+makeShot -theme beach -subject human -anim idle -mood sunset -camera static -fx cape -wind -s 1 -e 72
+pose -part arm -side both -action raise -amount large
+pose -part elbow -side R -action bend -amount 60
+pose -part head -action turn -dir left
+rigReport
+```
+
+![Make a shot and posing](docs/shot.png)
+
 ### Testing without models
 
 `tools/mock_ai.py` imitates both the Ollama and OpenRouter APIs, including tev1 tool calls and streaming:
@@ -388,7 +479,8 @@ See [docs/VPS_SPECS.md](docs/VPS_SPECS.md) for the specs needed to run Rust Maya
 
 ```
 src/
-  main.rs        app entry (eframe + wgpu)
+  main.rs        app entry (eframe + wgpu); --render / --help / --version
+  batch.rs       command-line batch renderer (no window)
   scene.rs       DAG nodes, channels, keyframe curves, layers, materials
   mesh.rs        n-gon mesh, primitives, extrude, Catmull-Clark, shells, OBJ I/O, deformed-normal fast path
   mesh_ops.rs    edge loops/rings, insert edge loop, bevel, bridge, merge, mirror, dissolve edge
@@ -396,12 +488,19 @@ src/
   curve_ops.rs   undoable curve, surface and wire actions + their MEL commands
   quad_draw.rs   Quad Draw retopology (live surface snapping, fill, extend, relax)
   deform.rs      lattice, wrap and wire deformers
-  fx.rs          particles and cloth: emitters, forces, collisions, PBD cloth, per-frame caches, FX MEL
+  fx.rs          particles, cloth (with self-collision) and fields: emitters, forces, collisions, PBD cloth,
+                 per-frame caches, FX MEL
+  hair.rs        hair systems and dynamic curves (DFTL strands, rest-shape stiffness, collisions)
+  director.rs    "make a shot": characters, themed sets, shot cameras, FX presets, text → makeShot
+  rig_report.rs  rig explainer (rigReport) and skin weight normalising
+  posing.rs      pose command and the plain-English pose parser
   modeling_ops.rs undoable edge-modeling actions
   prefs.rs       preferences, recent files, autosave and crash recovery
   look.rs        materials, lights, cameras, look-through, GPU light setup
   export/        glTF 2.0 (.glb/.gltf) and USD (.usda) exporters with animation baking
   importer/      glTF 2.0 and USD (.usd/.usda/.usdc/.usdz: parser, composition, MaterialX, UsdSkel) importers
+  fbx/           FBX node tree (binary reader/writer, ASCII reader), FBX importer and exporter
+  reduce.rs      Mesh › Reduce (quadric decimation) and Soften / Harden Edge
   camera.rs      persp/ortho cameras, projection, picking rays
   render.rs      wgpu renderer (offscreen MSAA + depth, shaded/line pipelines, blit into egui)
   app.rs         editor state and every undoable action
@@ -420,8 +519,8 @@ src/
 ## Roadmap
 
 These items appear in the UI as disabled "planned" entries:
-- Modeling: NURBS surfaces as true NURBS (today surface tools output polygons), Reduce, Soften/Harden Edge
-- FBX, USD value clips, light-path passes (direct / indirect / specular)
-- FX: fluids, hair, fields as separate nodes, cloth self-collision
+- Modeling: NURBS surfaces as true NURBS (today surface tools output polygons)
+- USD value clips, FBX NURBS curves, sub-frame simulation motion blur
+- FX: fluids, hair clumping / shading models, cloth tearing
 
 *Not affiliated with Autodesk. Maya is a trademark of Autodesk, Inc.*

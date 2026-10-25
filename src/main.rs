@@ -4,12 +4,16 @@
 mod ai;
 mod anim_ops;
 mod app;
+mod batch;
 mod camera;
 mod commands;
 mod curve_ops;
 mod deform;
+mod director;
 mod export;
+mod fbx;
 mod fx;
+mod hair;
 mod importer;
 mod look;
 mod mesh;
@@ -20,9 +24,12 @@ mod prefs;
 mod quad_draw;
 mod raytrace;
 mod recipes;
+mod reduce;
 mod render;
 mod render_view;
 mod rig;
+mod rig_report;
+mod posing;
 mod rig_ops;
 mod scene;
 mod sculpt;
@@ -34,6 +41,24 @@ mod ui;
 mod voice;
 
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--render" | "-render") => {
+            batch::attach_console();
+            std::process::exit(batch::run(&args[1..]));
+        }
+        Some("--help" | "-h" | "/?") => {
+            batch::attach_console();
+            print!("{}", batch::HELP);
+            return Ok(());
+        }
+        Some("--version" | "-v") => {
+            batch::attach_console();
+            println!("Rust Maya {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        _ => {}
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Rust Maya 2026")

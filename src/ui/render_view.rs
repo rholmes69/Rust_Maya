@@ -134,6 +134,11 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui, st: &mut RenderViewUi) {
         ui.checkbox(&mut s.denoise, "Denoise").on_hover_text("Edge-aware denoiser guided by albedo and normals (applied to the display and saved images)");
         ui.label("Clamp");
         ui.add(egui::DragValue::new(&mut s.clamp).range(0.1..=1000.0).speed(0.1));
+        ui.checkbox(&mut s.motion_blur, "Motion blur").on_hover_text("Blur moving objects, deforming characters and camera moves over the shutter");
+        if s.motion_blur {
+            ui.label("Shutter");
+            ui.add(egui::DragValue::new(&mut s.shutter).range(0.05..=2.0).speed(0.01).suffix(" fr")).on_hover_text("How long the shutter is open, in frames (0.5 = 180°)");
+        }
         ui.checkbox(&mut st.zoom_fit, "Fit");
         egui::ComboBox::from_id_salt("rv_pass").selected_text(st.pass.name()).show_ui(ui, |ui| {
             for p in Pass::ALL {

@@ -632,8 +632,19 @@ pub fn evaluate(scene: &mut Scene) {
         let pole = pole.filter(|p| scene.node(*p).is_some()).map(|p| world_pos(scene, p));
         solve_ik_twist(scene, s, e, goal, pole, twist);
     }
+    // Constraints again: nodes under IK chains (e.g. a wrist orient-constrained to a hand
+    // control) must use the solved parents, or the result depends on the previous evaluation.
+    for (id, cs) in &constrained {
+        for c in cs {
+            apply_constraint(scene, *id, c);
+        }
+    }
     // Simulations (particles, cloth) catch up to the current frame.
     crate::fx::update(scene);
+    // Hair; dynamic curves rewrite their output curves, so surfaces built from them update too.
+    if crate::hair::update(scene) {
+        crate::nurbs::update_history(scene);
+    }
 }
 
 // ------------------------------------------------------------------------ joint orient

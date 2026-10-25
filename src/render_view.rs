@@ -59,9 +59,16 @@ impl Default for RenderViewState {
     }
 }
 
+/// `C:/out/shot` → `C:/out/shot.0007.png`; a known image extension on `base` is kept
+/// (`shot.exr` → `shot.0007.exr`).
 pub fn frame_path(base: &str, frame: i32) -> String {
-    let b = base.strip_suffix(".png").unwrap_or(base);
-    format!("{b}.{frame:04}.png")
+    for ext in ["png", "exr", "jpg", "jpeg", "tga", "bmp"] {
+        let n = base.len();
+        if n > ext.len() + 1 && base[n - ext.len() - 1..].eq_ignore_ascii_case(&format!(".{ext}")) {
+            return format!("{}.{frame:04}.{ext}", &base[..n - ext.len() - 1]);
+        }
+    }
+    format!("{base}.{frame:04}.png")
 }
 
 impl App {
@@ -128,17 +135,43 @@ impl App {
         (gen_key, s)
     }
 
+    /// Camera and path-tracer scene for a render. With motion blur on, geometry and camera
+    /// are taken at shutter open and close (centred on the current frame) and interpolated
+    /// per sample; the static cache is bypassed.
+    fn render_setup(&mut self, rc: RenderCam, s: &RenderSettings) -> (u64, RtCamera, Arc<RtScene>) {
+        let cam = self.render_camera(rc);
+        if !s.motion_blur || s.shutter <= 0.0 {
+            let (k, sc) = self.render_scene(&cam);
+            return (k, cam, sc);
+        }
+        let t = self.scene.time;
+        let half = s.shutter.clamp(0.0, 2.0) * 0.5;
+        self.set_time(t - half);
+        let cam0 = self.render_camera(rc);
+        let g0 = self.render_geometry();
+        self.set_time(t + half);
+        let cam1 = self.render_camera(rc);
+        let g1 = self.render_geometry();
+        self.set_time(t);
+        let cam = cam0.with_motion(&cam1);
+        let sc = Arc::new(RtScene::build_motion(&g0, Some(&g1), &cam));
+        // The key is the current frame's content (what IPR compares against).
+        drop((g0, g1));
+        let g = self.render_geometry();
+        (self.render_content_key(&g), cam, sc)
+    }
+
     /// Start (or restart) a progressive render in the Render View.
     pub fn start_render(&mut self) {
-        let cam = self.render_camera(self.render.camera);
-        let (gen_key, scene) = self.render_scene(&cam);
+        let settings = self.render.settings.clone();
+        let (gen_key, cam, scene) = self.render_setup(self.render.camera, &settings);
         if let Some(j) = &self.render.job {
             j.cancel();
         }
-        let settings = self.render.settings.clone();
         // A region render keeps the previous image outside the region.
         let base = settings.region.and_then(|_| self.render.job.as_ref().filter(|j| j.size() == (settings.width, settings.height)).map(|j| j.final_linear()));
-        self.render.job_key = (gen_key, cam.key(), settings.key());
+        let cam_key = self.render_camera(self.render.camera).key();
+        self.render.job_key = (gen_key, cam_key, settings.key());
         self.render.job = Some(RenderJob::start_with_base(scene, cam, settings, base));
         self.render.open = true;
     }
@@ -164,23 +197,45 @@ impl App {
             }
             None => self.render.camera,
         };
-        let c = self.render_camera(rc);
-        let (_, scene) = self.render_scene(&c);
+        let (_, c, scene) = self.render_setup(rc, &settings);
         Ok(crate::raytrace::render_blocking(scene, c, settings))
     }
 
-    /// Render frames start..=end to `base.####.png` (blocking).
-    pub fn render_sequence_now(&mut self, cam: Option<&str>, settings: RenderSettings, start: i32, end: i32, base: &str) -> Result<usize, String> {
+    /// Render frames start..=end (blocking): beauty to `base.####.ext`, or with `passes`
+    /// every pass as `base_<pass>.####.ext`. `on_frame(frame, seconds, files)` runs after
+    /// each frame (batch progress).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frames(&mut self, cam: Option<&str>, settings: RenderSettings, start: i32, end: i32, base: &str, passes: bool, on_frame: &mut dyn FnMut(i32, f32, &[String])) -> Result<usize, String> {
         let t0 = self.scene.time;
         let mut n = 0;
-        for f in start..=end {
-            self.set_time(f as f32);
-            let job = self.render_now(cam, settings.clone())?;
-            job.save_png(std::path::Path::new(&frame_path(base, f)), settings.exposure, settings.tonemap)?;
-            n += 1;
-        }
+        let res = (|| {
+            for f in start..=end {
+                self.set_time(f as f32);
+                let mut job = self.render_now(cam, settings.clone())?;
+                let files = if passes {
+                    let mut files = Vec::new();
+                    let fp = frame_path(base, f);
+                    let ext = std::path::Path::new(&fp).extension().and_then(|e| e.to_str()).unwrap_or("png").to_string();
+                    // shot.0007.png → shot_<pass>.0007.png
+                    let root = base_without_ext(base);
+                    for pass in crate::raytrace::Pass::ALL {
+                        let file = format!("{root}_{}.{f:04}.{ext}", pass.file_tag());
+                        job.save_pass(pass, std::path::Path::new(&file), settings.exposure, settings.tonemap)?;
+                        files.push(file);
+                    }
+                    files
+                } else {
+                    let file = frame_path(base, f);
+                    job.save_png(std::path::Path::new(&file), settings.exposure, settings.tonemap)?;
+                    vec![file]
+                };
+                n += 1;
+                on_frame(f, job.elapsed().as_secs_f32(), &files);
+            }
+            Ok::<(), String>(())
+        })();
         self.set_time(t0);
-        Ok(n)
+        res.map(|_| n)
     }
 
     /// Start a non-blocking sequence render in the Render View.
@@ -245,6 +300,16 @@ impl App {
         job.settings.denoise = denoise;
         job.save_passes(std::path::Path::new(path), self.render.settings.exposure, self.render.settings.tonemap)
     }
+}
+
+fn base_without_ext(base: &str) -> &str {
+    for ext in ["png", "exr", "jpg", "jpeg", "tga", "bmp"] {
+        let n = base.len();
+        if n > ext.len() + 1 && base[n - ext.len() - 1..].eq_ignore_ascii_case(&format!(".{ext}")) {
+            return &base[..n - ext.len() - 1];
+        }
+    }
+    base
 }
 
 pub fn parse_tonemap(s: &str) -> Option<ToneMap> {

@@ -329,6 +329,48 @@ impl Writer<'_> {
                 self.line(d + 1, &format!("color3f[] primvars:displayColor = [{}]", lin(ps.settings.color)));
                 self.line(d, "}");
             }
+            Shape::Hair(h) => {
+                // Linear BasisCurves (one curve per strand), tapered widths, root→tip colours.
+                let per = h.points_per_strand();
+                let inv = sc.world_matrix(id).inverse();
+                let mut now: Vec<Vec3> = h.current().unwrap_or(&[]).iter().map(|p| inv.transform_point3(*p)).collect();
+                if now.is_empty()
+                    && let Some(first) = self.baked.hair.get(&id).and_then(|hh| hh.first())
+                {
+                    now = first.clone();
+                }
+                if per >= 2 && now.len() >= per {
+                    let st = &h.settings;
+                    let n_strands = now.len() / per;
+                    self.counts[3] += 1;
+                    self.line(d, &format!("def BasisCurves \"{shape_name}\""));
+                    self.line(d, "{");
+                    self.line(d + 1, "uniform token type = \"linear\"");
+                    self.line(d + 1, "uniform token wrap = \"nonperiodic\"");
+                    self.line(d + 1, &format!("int[] curveVertexCounts = [{}]", vec![per.to_string(); n_strands].join(", ")));
+                    self.line(d + 1, &format!("point3f[] points = {}", points(&now)));
+                    if let Some(hh) = self.baked.hair.get(&id).filter(|hh| hh.iter().all(|p| p.len() == now.len())) {
+                        let fr = &self.baked.frames;
+                        let mut s = String::new();
+                        for (fi, p) in hh.iter().enumerate() {
+                            let _ = write!(s, "{}: {}, ", f(fr[fi]), points(p));
+                        }
+                        self.line(d + 1, &format!("point3f[] points.timeSamples = {{ {} }}", s.trim_end_matches(", ")));
+                    }
+                    let widths: Vec<String> = (0..per).map(|i| f(st.width + (st.tip_width - st.width) * i as f32 / (per - 1) as f32)).collect();
+                    let all: Vec<String> = (0..n_strands).flat_map(|_| widths.iter().cloned()).collect();
+                    self.line(d + 1, &format!("float[] widths = [{}] (interpolation = \"vertex\")", all.join(", ")));
+                    let cols: Vec<String> = (0..per)
+                        .map(|i| {
+                            let k = i as f32 / (per - 1) as f32;
+                            lin([0, 1, 2].map(|c| st.color[c] + (st.tip_color[c] - st.color[c]) * k))
+                        })
+                        .collect();
+                    let allc: Vec<String> = (0..n_strands).flat_map(|_| cols.iter().cloned()).collect();
+                    self.line(d + 1, &format!("color3f[] primvars:displayColor = [{}] (interpolation = \"vertex\")", allc.join(", ")));
+                    self.line(d, "}");
+                }
+            }
             Shape::Light(l) => {
                 self.counts[1] += 1;
                 let (ty, api) = match l.kind {

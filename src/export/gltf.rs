@@ -1,5 +1,11 @@
 //! glTF 2.0 exporter: hierarchy, meshes (normals), PBR materials, skins, morph targets,
 //! baked TRS / morph-weight animation, KHR_lights_punctual lights and cameras.
+//!
+//! Simulations: cloth and other point deformers (clusters, lattices, wraps, wires) are baked as
+//! one morph target per frame with one-hot weight animation; hair exports as a LINES mesh with
+//! the same per-frame morph targets; particles become child nodes (one per particle slot) that
+//! share a small octahedron mesh, with animated translation and STEP-animated scale for
+//! birth / death.
 
 use super::{srgb_to_linear, Baked, ExportOptions, ExportSet};
 use crate::app::App;
@@ -70,6 +76,29 @@ impl Bin {
         self.accessors.push(json!({ "bufferView": view, "componentType": USHORT, "count": data.len() / 4, "type": "VEC4" }));
         self.accessors.len() - 1
     }
+}
+
+/// Most frames baked into per-frame morph targets (longer ranges are sampled evenly).
+const MAX_MORPH_FRAMES: usize = 300;
+/// Most particle slots (child nodes) per particle system.
+const MAX_PARTICLE_SLOTS: usize = 5000;
+
+/// Mesh deformations glTF can't express natively (baked to per-frame morph targets).
+fn point_cached(n: &crate::scene::Node) -> bool {
+    n.cloth.is_some() || !n.clusters.is_empty() || !n.lattices.is_empty() || n.wrap.is_some() || !n.wires.is_empty()
+}
+
+/// Frame indices to bake as morph targets: evenly strided, always with the last frame.
+fn frame_picks(n: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let stride = n.div_ceil(MAX_MORPH_FRAMES).max(1);
+    let mut v: Vec<usize> = (0..n).step_by(stride).collect();
+    if *v.last().unwrap() != n - 1 {
+        v.push(n - 1);
+    }
+    v
 }
 
 fn lin3(c: [f32; 3]) -> [f32; 3] {
@@ -199,6 +228,13 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
         })
     };
 
+    // Baked animation (sampled before the meshes: cloth and hair become per-frame morph targets).
+    let needs_points = set.order.iter().any(|id| scene.node(*id).is_some_and(point_cached));
+    let baked = Baked::sample(app, &set, opts, needs_points);
+    // (node index, baked frame indices) for per-frame morph weight animation.
+    let mut morph_anims: Vec<(usize, Vec<usize>)> = Vec::new();
+    // Particle systems to expand into slot nodes after the main pass.
+    let mut particle_nodes: Vec<NodeId> = Vec::new();
     let mut n_meshes = 0;
     let mut n_skins = 0;
     let mut n_morph = 0;
@@ -221,6 +257,9 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
         }
         match &n.shape {
             Shape::Poly { mesh, .. } if scene.is_visible(id) && !mesh.faces.is_empty() => {
+                // Cloth / clusters / lattices / wraps / wires: per-frame morph targets.
+                let pc_frames = baked.points.get(&id).filter(|f| point_cached(n) && f.iter().all(|p| p.len() == mesh.positions.len()));
+                let pc = pc_frames.is_some();
                 let tri = mesh.triangulate();
                 // Deduplicate corners by (vertex, normal, uv).
                 let repeat = n.material.and_then(|m| app.material(m)).map(|m| glam::Vec2::from(m.repeat_uv)).unwrap_or(glam::Vec2::ONE);
@@ -290,7 +329,7 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
                     }
                 }
                 // Skin.
-                if let Some(sk) = n.skin.as_ref().filter(|sk| sk.weights.len() == mesh.positions.len()) {
+                if let Some(sk) = n.skin.as_ref().filter(|sk| !pc && sk.weights.len() == mesh.positions.len()) {
                     if sk.joints.iter().all(|j| index.contains_key(j)) {
                         let mut jd: Vec<u16> = Vec::with_capacity(corner_vert.len() * 4);
                         let mut wd: Vec<f32> = Vec::with_capacity(corner_vert.len() * 4);
@@ -321,7 +360,20 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
                 prim["material"] = json!(material_for(id, &mut materials, &mut bin, &mut images, &mut textures, &mut notes));
                 let mut mesh_v = json!({ "name": format!("{}Shape", n.name), "primitives": [] });
                 // Morph targets (blend shapes).
-                if let Some(bs) = n.blend.as_ref().filter(|b| !b.targets.is_empty() && b.targets.iter().all(|t| t.deltas.len() == mesh.positions.len())) {
+                if let Some(frames) = pc_frames {
+                    let picks = frame_picks(frames.len());
+                    let mut targets = Vec::new();
+                    for &fi in &picks {
+                        let d: Vec<f32> = corner_vert.iter().flat_map(|v| (frames[fi][*v as usize] - mesh.positions[*v as usize]).to_array()).collect();
+                        targets.push(json!({ "POSITION": bin.floats(&d, "VEC3", 3, Some(ARRAY_BUFFER), true) }));
+                    }
+                    prim["targets"] = json!(targets);
+                    mesh_v["weights"] = json!(vec![0.0; picks.len()]);
+                    mesh_v["extras"] = json!({ "targetNames": picks.iter().map(|fi| format!("frame{}", baked.frames[*fi])).collect::<Vec<_>>() });
+                    n_morph += picks.len();
+                    notes.push(format!("{}: {} frames of point animation baked as morph targets", n.name, picks.len()));
+                    morph_anims.push((index[&id], picks));
+                } else if let Some(bs) = n.blend.as_ref().filter(|b| !b.targets.is_empty() && b.targets.iter().all(|t| t.deltas.len() == mesh.positions.len())) {
                     let mut targets = Vec::new();
                     for t in &bs.targets {
                         let d: Vec<f32> = corner_vert.iter().flat_map(|v| t.deltas[*v as usize].to_array()).collect();
@@ -332,14 +384,59 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
                     mesh_v["extras"] = json!({ "targetNames": bs.targets.iter().map(|t| t.name.clone()).collect::<Vec<_>>() });
                     n_morph += bs.targets.len();
                 }
-                if !n.clusters.is_empty() {
-                    notes.push(format!("{}: cluster deformers are not exported (baked shape only in USD)", n.name));
+                if !n.clusters.is_empty() && !pc {
+                    notes.push(format!("{}: cluster deformers are not exported (no animation to bake)", n.name));
                 }
                 mesh_v["primitives"] = json!([prim]);
                 meshes.push(mesh_v);
                 node["mesh"] = json!(meshes.len() - 1);
                 n_meshes += 1;
             }
+            Shape::Hair(h) if scene.is_visible(id) => {
+                let per = h.points_per_strand();
+                let frames = baked.hair.get(&id);
+                let inv = scene.world_matrix(id).inverse();
+                let base: Vec<Vec3> = frames.and_then(|f| f.first().cloned()).unwrap_or_else(|| h.current().unwrap_or(&[]).iter().map(|p| inv.transform_point3(*p)).collect());
+                if per >= 2 && base.len() >= per {
+                    let st = &h.settings;
+                    let pos: Vec<f32> = base.iter().flat_map(|p| p.to_array()).collect();
+                    let mut col: Vec<f32> = Vec::with_capacity(base.len() * 3);
+                    let mut idx: Vec<u32> = Vec::new();
+                    for j in 0..base.len() / per {
+                        for i in 0..per {
+                            let k = i as f32 / (per - 1) as f32;
+                            col.extend(lin3([0, 1, 2].map(|c| st.color[c] + (st.tip_color[c] - st.color[c]) * k)));
+                            if i + 1 < per {
+                                idx.extend([(j * per + i) as u32, (j * per + i + 1) as u32]);
+                            }
+                        }
+                    }
+                    let attrs = json!({
+                        "POSITION": bin.floats(&pos, "VEC3", 3, Some(ARRAY_BUFFER), true),
+                        "COLOR_0": bin.floats(&col, "VEC3", 3, Some(ARRAY_BUFFER), false),
+                    });
+                    materials.push(json!({ "name": format!("{}_hair", n.name), "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.6 } }));
+                    let mut prim = json!({ "attributes": attrs, "indices": bin.indices(&idx), "mode": 1, "material": materials.len() - 1 });
+                    let mut mesh_v = json!({ "name": format!("{}Shape", n.name), "primitives": [] });
+                    if let Some(frames) = frames.filter(|f| f.len() > 1 && f.iter().all(|p| p.len() == base.len())) {
+                        let picks = frame_picks(frames.len());
+                        let mut targets = Vec::new();
+                        for &fi in &picks {
+                            let d: Vec<f32> = frames[fi].iter().zip(&base).flat_map(|(p, b)| (*p - *b).to_array()).collect();
+                            targets.push(json!({ "POSITION": bin.floats(&d, "VEC3", 3, Some(ARRAY_BUFFER), true) }));
+                        }
+                        prim["targets"] = json!(targets);
+                        mesh_v["weights"] = json!(vec![0.0; picks.len()]);
+                        n_morph += picks.len();
+                        morph_anims.push((index[&id], picks));
+                    }
+                    mesh_v["primitives"] = json!([prim]);
+                    meshes.push(mesh_v);
+                    node["mesh"] = json!(meshes.len() - 1);
+                    n_meshes += 1;
+                }
+            }
+            Shape::Particles(_) if scene.is_visible(id) => particle_nodes.push(id),
             Shape::Light(l) => {
                 let c = lin3(l.color);
                 let mut lv = json!({ "name": n.name, "color": c, "intensity": l.intensity });
@@ -375,8 +472,121 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
         nodes.push(node);
     }
 
+    // Particles: one child node per particle slot, sharing an octahedron mesh.
+    // (node index, path, values, type, components, interpolation)
+    let mut extra_channels: Vec<(usize, &str, Vec<f32>, &str, usize, &str)> = Vec::new();
+    let mut n_particle_nodes = 0;
+    for pid in particle_nodes {
+        let Some(Shape::Particles(ps)) = scene.node(pid).map(|n| &n.shape) else { continue };
+        let pname = scene.node(pid).map(|n| n.name.clone()).unwrap_or_default();
+        // Per-frame positions with stable ids (or the current frame when there's no animation).
+        let (frames, ids): (Vec<Vec<Vec3>>, Vec<Vec<u32>>) = match (baked.particles.get(&pid), baked.particle_ids.get(&pid)) {
+            (Some(f), Some(i)) if !baked.frames.is_empty() => (f.clone(), i.clone()),
+            _ => {
+                let inv = scene.world_matrix(pid).inverse();
+                (vec![ps.current().iter().map(|q| inv.transform_point3(q.p)).collect()], vec![ps.current().iter().map(|q| q.id).collect()])
+            }
+        };
+        // Slot assignment: a particle keeps its slot for life; a freed slot waits one frame
+        // before reuse so the (hidden) jump to a new particle never interpolates on screen.
+        let nf = frames.len();
+        let mut slot_of: HashMap<u32, usize> = HashMap::new();
+        let mut free: Vec<usize> = Vec::new();
+        let mut cooling: Vec<usize> = Vec::new();
+        let mut slots: Vec<Vec<Option<Vec3>>> = Vec::new();
+        let mut dropped = false;
+        for f in 0..nf {
+            free.append(&mut cooling);
+            let alive: std::collections::HashSet<u32> = ids[f].iter().copied().collect();
+            slot_of.retain(|p, s| {
+                let keep = alive.contains(p);
+                if !keep {
+                    cooling.push(*s);
+                }
+                keep
+            });
+            free.sort_unstable_by(|a, b| b.cmp(a));
+            for (k, p) in ids[f].iter().enumerate() {
+                let s = match slot_of.get(p) {
+                    Some(s) => *s,
+                    None => {
+                        let s = match free.pop() {
+                            Some(s) => s,
+                            None if slots.len() < MAX_PARTICLE_SLOTS => {
+                                slots.push(vec![None; nf]);
+                                slots.len() - 1
+                            }
+                            None => {
+                                dropped = true;
+                                continue;
+                            }
+                        };
+                        slot_of.insert(*p, s);
+                        s
+                    }
+                };
+                slots[s][f] = Some(frames[f][k]);
+            }
+        }
+        if dropped {
+            notes.push(format!("{pname}: more than {MAX_PARTICLE_SLOTS} particles alive at once; extra particles skipped"));
+        }
+        if slots.is_empty() {
+            continue;
+        }
+        // Shared octahedron.
+        let r = ps.settings.radius;
+        let dirs = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+        let pos: Vec<f32> = dirs.iter().flat_map(|d| (*d * r).to_array()).collect();
+        let nrm: Vec<f32> = dirs.iter().flat_map(|d| d.to_array()).collect();
+        let idx: Vec<u32> = vec![0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4, 2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5];
+        let c = lin3(ps.settings.color);
+        materials.push(json!({ "name": format!("{pname}_particles"), "pbrMetallicRoughness": { "baseColorFactor": [c[0], c[1], c[2], 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.5 } }));
+        let prim = json!({
+            "attributes": { "POSITION": bin.floats(&pos, "VEC3", 3, Some(ARRAY_BUFFER), true), "NORMAL": bin.floats(&nrm, "VEC3", 3, Some(ARRAY_BUFFER), false) },
+            "indices": bin.indices(&idx), "mode": 4, "material": materials.len() - 1,
+        });
+        meshes.push(json!({ "name": format!("{pname}_particleShape"), "primitives": [prim] }));
+        let mesh_i = meshes.len() - 1;
+        n_meshes += 1;
+        let mut kids = Vec::new();
+        for (si, track) in slots.iter().enumerate() {
+            // Dead frames hold the nearest live position (before birth: the birth position).
+            let first = track.iter().flatten().next().copied().unwrap_or(Vec3::ZERO);
+            let mut last = first;
+            let tr: Vec<Vec3> = track
+                .iter()
+                .map(|p| {
+                    if let Some(p) = p {
+                        last = *p;
+                    }
+                    last
+                })
+                .collect();
+            let alive: Vec<f32> = track.iter().map(|p| if p.is_some() { 1.0 } else { 0.0 }).collect();
+            let mut node = json!({ "name": format!("{pname}_p{si}"), "mesh": mesh_i, "translation": tr[0].to_array() });
+            if alive[0] == 0.0 {
+                node["scale"] = json!([0.0, 0.0, 0.0]);
+            }
+            nodes.push(node);
+            let ni = nodes.len() - 1;
+            kids.push(ni);
+            if nf > 1 {
+                extra_channels.push((ni, "translation", tr.iter().flat_map(|p| p.to_array()).collect(), "VEC3", 3, "LINEAR"));
+                extra_channels.push((ni, "scale", alive.iter().flat_map(|a| [*a, *a, *a]).collect(), "VEC3", 3, "STEP"));
+            }
+            n_particle_nodes += 1;
+        }
+        let pn = &mut nodes[index[&pid]];
+        let mut ch: Vec<Value> = pn.get("children").and_then(|c| c.as_array().cloned()).unwrap_or_default();
+        ch.extend(kids.into_iter().map(|k| json!(k)));
+        pn["children"] = json!(ch);
+    }
+    if n_particle_nodes > 0 {
+        notes.push(format!("{n_particle_nodes} particle node(s)"));
+    }
+
     // Baked animation.
-    let baked = Baked::sample(app, &set, opts, false);
     let mut animations = Vec::new();
     let mut n_channels = 0;
     if !baked.frames.is_empty() {
@@ -420,6 +630,25 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
                 n_channels += 1;
             }
         }
+        // Per-frame morph targets: one-hot weights (linear blend between baked frames).
+        for (ni, picks) in &morph_anims {
+            let t: Vec<f32> = picks.iter().map(|fi| times[*fi]).collect();
+            let input = if picks.len() == times.len() { time_acc } else { bin.floats(&t, "SCALAR", 1, None, true) };
+            let mut w = vec![0.0f32; picks.len() * picks.len()];
+            for k in 0..picks.len() {
+                w[k * picks.len() + k] = 1.0;
+            }
+            let out = bin.floats(&w, "SCALAR", 1, None, false);
+            samplers.push(json!({ "input": input, "output": out, "interpolation": "LINEAR" }));
+            channels.push(json!({ "sampler": samplers.len() - 1, "target": { "node": ni, "path": "weights" } }));
+            n_channels += 1;
+        }
+        for (ni, path, data, ty, comps, interp) in &extra_channels {
+            let out = bin.floats(data, ty, *comps, None, false);
+            samplers.push(json!({ "input": time_acc, "output": out, "interpolation": interp }));
+            channels.push(json!({ "sampler": samplers.len() - 1, "target": { "node": ni, "path": path } }));
+            n_channels += 1;
+        }
         if !channels.is_empty() {
             animations.push(json!({ "name": "take1", "samplers": samplers, "channels": channels }));
         }
@@ -458,7 +687,7 @@ pub fn build(app: &App, opts: &ExportOptions) -> Result<(Value, Vec<u8>, String)
     }
     let mut summary = format!(
         "glTF: {} nodes, {n_meshes} meshes, {} materials, {n_skins} skins, {n_morph} morph targets, {n_channels} animation channels ({} frames), {n_lights} lights, {} cameras",
-        set.order.len(),
+        nodes.len(),
         doc["materials"].as_array().map(|a| a.len()).unwrap_or(0),
         baked.frames.len(),
         doc["cameras"].as_array().map(|a| a.len()).unwrap_or(0),

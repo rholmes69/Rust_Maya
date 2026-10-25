@@ -295,6 +295,20 @@ pub fn parse_simple(text: &str) -> Option<Vec<String>> {
     if let Some(r) = parse_recipe(&words) {
         return Some(vec![r]);
     }
+    if matches!(
+        t.as_str(),
+        "explain my rig" | "explain rig" | "explain the rig" | "check my rig" | "check rig" | "check the rig" | "rig report" | "how does my rig work" | "how does the rig work" | "what's wrong with my rig" | "what is wrong with my rig"
+    ) {
+        return Some(vec!["rigReport".into()]);
+    }
+    if crate::director::is_shot_request(&t) {
+        return Some(vec![crate::director::shot_mel(&crate::director::parse_shot(&t))]);
+    }
+    if crate::posing::is_pose_request(&t)
+        && let Some(p) = crate::posing::parse_pose(text)
+    {
+        return Some(p);
+    }
     if words.len() > 9 || t.contains(" and ") || t.contains(" then ") || t.contains(" of ") || t.contains("animate") || t.contains(" each ") {
         return None;
     }
@@ -527,6 +541,9 @@ mod tests {
         assert_eq!(parse_simple("build a castle with four towers and a moat"), None);
         assert_eq!(parse_simple("make a ring of cubes"), None);
         assert_eq!(parse_simple("make the sphere bounce"), None);
+        assert_eq!(parse_simple("explain my rig"), Some(vec!["rigReport".into()]));
+        assert_eq!(parse_simple("raise the left arm and look right"), Some(vec!["pose -part arm -side L -action raise".into(), "pose -part head -action turn -dir right".into()]));
+        assert!(parse_simple("make a shot of a robot walking in the desert at sunset").is_some_and(|v| v[0].starts_with("makeShot -theme desert -subject robot -anim walk")));
         assert_eq!(parse_simple("add a big cube next to the sphere"), None);
     }
 }

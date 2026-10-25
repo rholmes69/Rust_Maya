@@ -93,6 +93,14 @@ FX (simulations play with the timeline; set playbackOptions first; currentTime N
   setAttr sparks.turbulence 2; setAttr sparks.wind 3 0 0; setAttr sparks.gravity 0 -9.81 0; setAttr sparks.bounce 0.5   (volume emitter: scale it)
   nCloth -stretch 1 -bend 0.1 cape (a subdivided polyPlane works well: polyPlane -w 2 -h 2 -sx 20 -sy 20)
   clothPin -to chest_jnt cape.vtx[0:20] (pins follow a joint/control)   setAttr flag.wind 5 0 0   connectDynamic -c body cape (collider)
+  nCloth -selfCollide cape (or setAttr cape.selfCollide 1) keeps folds from passing through each other
+  FIELDS (nodes; move / rotate to place and aim; act on the selected simulations at creation, or on all if none):
+  airField -m 5 -dx 1 -dy 0 -dz 0 [-s 1] (wind)  gravityField  uniformField  radialField -m 5 -att 1  vortexField -m 4 (axis = -dx/-dy/-dz)
+  turbulenceField -m 3 -f 1  dragField -m 0.5  newtonField -m 5 (attractor)  [-mxd maxDistance] [-p x y z] [-n name] [targets]
+  connectDynamic -f gust cape (restrict a field to a target)   connectDynamic -rf gust cape   setAttr gust.magnitude 8
+  HAIR: hairSystem [-count 400] [-length 0.3] [-seg 8] [-curl 20] [-stiff 0.25] [-width 0.01] [-rgb r g b] [-n hair] headMesh
+      (strands follow the deforming mesh; setAttr hair.stiffness/tipStiffness/combAmount/comb x y z/drag/gravity; connectDynamic -c body hair)
+  makeCurvesDynamic [-pinTip] rope   (creates rope_dyn, a curve that swings; use it for wires, extrude, emitters)   hairToCurves hair
 RECIPES (tuned one-liners — PREFER these for lighting, materials and character animation; each is one undo step):
   lightRig -preset studio|outdoor|sunset|night|product|dramatic [-i 1.0] [-target objects]
       builds a named light rig (key_light, fill_light, rim_light, sun_light, ...) aimed at the subject, grouped as lightRig
@@ -102,14 +110,28 @@ RECIPES (tuned one-liners — PREFER these for lighting, materials and character
   rigAnimate -anim walk|run|jump|wave|idle|dance [-s startFrame] [-e endFrame] [-travel on|off] [mesh]
       Quick Rigs the mesh if there is no rig yet, then keys the *_ctrl controls procedurally
   renderCheck   renders a small preview and reports exposure / framing / lighting problems with suggested fixes
+DIRECTOR (whole shots in one statement each):
+  makeShot -theme forest|city|desert|beach|studio|snow|space [-subject human|robot|alien|none] [-anim walk|run|jump|wave|idle|dance]
+      [-mood studio|outdoor|sunset|night|product|dramatic] [-camera static|track|dolly|orbit|crane] [-fx rain|snow|sparks|fireflies|dust|leaves|cape|flag]...
+      [-wind] [-s 1 -e 120] [-clear]   builds set + character + rig/animation + FX + light rig + render settings + shotCam, looks through it
+  character -style human|robot|alien [-h 1.8] [-p x y z] -n hero   environment -theme forest [-size 24] [-density 1] [-seed 7]
+  shotCamera -type static|track|dolly|orbit|crane [-target hero] [-s 1 -e 120] [-n shotCam]   fxPreset rain|snow|...|cape|flag [-wind]
+POSING (Quick Rig controls; FK joints if there are no controls):
+  pose -part arm|elbow|leg|knee|foot|head|chest|hips [-side L|R|both] -action raise|lower|forward|back|out|in|bend|straighten|lift|step|
+      turn|nod|tilt|lean|twist|crouch|stand|shift [-dir left|right|forward|back|up|down] [-amount small|large|<degrees>|<n>cm] [-key]
+      e.g. "pose -part arm -side L -action raise -amount 40", "pose -part head -action turn -dir right", "pose -part hips -action crouch -key"
+RIG CHECK: rigReport (explains skeleton, IK, controls, skins and lists problems with fix statements)   skinPercent -normalize mesh
 RENDER: render [-x 960 -y 540] [-spp 64] [-cam cameraName] [-o C:/path/out.png]   (CPU path tracer → Render View; -o saves a still)
-  render -o C:/path/shot.png -passes (beauty/albedo/normal/depth/objectid)   renderSettings -region 0.2 0.2 0.6 0.6 | -region off
+  render -o C:/path/shot.png -passes [specular,emission] (beauty/albedo/normal/depth/objectid/diffuse_direct/diffuse_indirect/specular/emission; .exr = float)
+  renderSettings -mb on -shutter 0.5 (motion blur)   renderSettings -region 0.2 0.2 0.6 0.6 | -region off
   camera depth of field: setAttr cam.depthOfField 1; setAttr cam.fStop 2.8; setAttr cam.focusDistance 6; setAttr cam.dofBlurScale 20
   render -seq -st 1 -e 24 -o C:/path/name   renderSettings -spp 128 -env 0.3 -exp 0.5 -tm filmic -bg env -dn on   renderView -ipr on|off
 IMPORT: file -import C:/path/model.glb [-take Walk] | .gltf | .obj   (brings in meshes, materials/textures, skins, blend shapes, animation)
+  file -import C:/path/character.fbx [-take Run]   (FBX 2011+ binary/ASCII: Mixamo/Maya/Blender/Max characters, skins, blend shapes, takes)
   file -import C:/path/stage.usd | .usda | .usdc | .usdz   (USD: composes subLayers/references/payloads/variants/inherits, UsdSkel characters,
   PointInstancers, UsdPreviewSurface + MaterialX looks, lights, cameras; Z-up / cm stages are converted to Y-up metres)
-EXPORT: file -export C:/path/scene.glb | .gltf | .usda | .obj  [-es selected only] [-na no animation]
+EXPORT: file -export C:/path/scene.glb | .gltf | .fbx | .usda | .obj  [-es selected only] [-na no animation] [-bo FBX: bake joint orients]
+MESH CLEANUP: polyReduce -p 75 mesh (removes 75 % of the triangles, keeps borders/UV seams/skin)   polySoftEdge -a 180 mesh (soft) | -a 0 (hard) | -a 30 | mesh.e[3:8]
   (glTF keeps skins, blend shapes, baked animation, lights, cameras; USD writes UsdSkel for skinned meshes and bakes other deformers to points)"#;
 
 pub const CONVENTIONS: &str = r#"COORDINATES: Maya convention, Y is UP, X right, +Z toward the viewer. 1 unit = 1 m. Objects are centered
@@ -253,6 +275,10 @@ pub enum Task {
     Help,
     /// Critique a preview render (image attached when the model can see) and suggest fixes.
     RenderCheck,
+    /// Plan a whole shot (set, character, animation, FX, lighting, camera) from a description.
+    MakeShot,
+    /// Explain a rig to the user from the automatic rig report and suggest fixes.
+    ExplainRig,
 }
 
 impl Task {
@@ -266,6 +292,8 @@ impl Task {
             Task::Palette => "Color Palette",
             Task::Help => "Help",
             Task::RenderCheck => "Render Check",
+            Task::MakeShot => "Make a Shot",
+            Task::ExplainRig => "Explain Rig",
         }
     }
 
@@ -278,6 +306,8 @@ impl Task {
             Task::HealthCheck => "You are a senior modeling TD reviewing a scene. You get an automatic report of issues. In \"reply\" give a short prioritised list (max 6 bullets) of what to fix and why it matters for rigging/animation/export. In \"mel\" put safe fix statements (e.g. makeIdentity / delete -ch on specific objects selected first, renames). Never delete user objects.",
             Task::Palette => "Choose a harmonious colour palette matching the user's description and apply it to the SELECTED objects using \"setColor r g b name\" statements with values 0-1 (one per object). Describe the palette in \"reply\".",
             Task::RenderCheck => "You are a lighting and look-development supervisor reviewing a preview render of the scene (the image is attached when your model can see images; otherwise rely on the measured statistics). In \"reply\" give a short critique (max 5 bullets): composition/framing, exposure, lighting (key/fill/rim, shadows, mood), materials, and the single most important fix first. In \"mel\" put concrete fixes — prefer lightRig / materialPreset / renderSettings -exp / setAttr light.intensity / viewFit; never delete user objects. The fixes are offered to the user as a button.",
+            Task::MakeShot => "You are a film director and layout artist. Build the shot the user describes. You get an offline draft (a makeShot statement picked from keywords): improve it so it matches the description (theme, subject, animation, mood, camera move, FX, frame range). Prefer ONE makeShot statement, optionally followed by a few refinements (materialPreset, setAttr light/emitter attributes, pose ... -key, extra props placed on the ground). Use -clear only if the user asks for a new/fresh scene. In \"reply\" describe the shot in one or two sentences, like a director's note.",
+            Task::ExplainRig => "You are a friendly rigging TD. You get an automatic report of the scene's rig. In \"reply\" explain in plain language how the rig works (what moves what, which controls the animator should use) in a few short sentences, then list the problems in order of importance and why they matter. In \"mel\" put safe fix statements (from the report's suggestions or similar: skinPercent -normalize, joint -e -oj xyz, poleVectorConstraint, makeIdentity); they are offered as a button. Never delete user objects.",
             Task::Help => "Answer the user's question about using this Maya-style app (tools, hotkeys, MEL) briefly. If an action would help, include the MEL for it in \"mel\" (it is offered as a button, not run automatically).",
         };
         format!(
