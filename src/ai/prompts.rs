@@ -91,8 +91,10 @@ RENDER: render [-x 960 -y 540] [-spp 64] [-cam cameraName] [-o C:/path/out.png] 
   camera depth of field: setAttr cam.depthOfField 1; setAttr cam.fStop 2.8; setAttr cam.focusDistance 6; setAttr cam.dofBlurScale 20
   render -seq -st 1 -e 24 -o C:/path/name   renderSettings -spp 128 -env 0.3 -exp 0.5 -tm filmic -bg env -dn on   renderView -ipr on|off
 IMPORT: file -import C:/path/model.glb [-take Walk] | .gltf | .obj   (brings in meshes, materials/textures, skins, blend shapes, animation)
+  file -import C:/path/stage.usd | .usda | .usdc | .usdz   (USD: composes subLayers/references/payloads/variants/inherits, UsdSkel characters,
+  PointInstancers, UsdPreviewSurface + MaterialX looks, lights, cameras; Z-up / cm stages are converted to Y-up metres)
 EXPORT: file -export C:/path/scene.glb | .gltf | .usda | .obj  [-es selected only] [-na no animation]
-  (glTF keeps skins, blend shapes, baked animation, lights, cameras; USD bakes deformation to point samples)"#;
+  (glTF keeps skins, blend shapes, baked animation, lights, cameras; USD writes UsdSkel for skinned meshes and bakes other deformers to points)"#;
 
 pub const CONVENTIONS: &str = r#"COORDINATES: Maya convention, Y is UP, X right, +Z toward the viewer. 1 unit = 1 m. Objects are centered
 on their position, so to rest an object on the ground set its Y to half its height (cube of height 2 -> y=1).

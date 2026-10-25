@@ -9,7 +9,9 @@ impl App {
     /// Give a freshly created node an explicit name (kept exactly if free, else made unique).
     pub fn apply_name(&mut self, id: NodeId, name: Option<&str>) {
         let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else { return };
-        let unique = if self.scene.name_exists(name) { self.scene.unique_name(name) } else { name.to_string() };
+        // Taken only if another node has the name (a node keeps its own name, e.g. "Geo2").
+        let taken = self.scene.nodes.iter().any(|n| n.id != id && n.name == name);
+        let unique = if taken { self.scene.unique_name(name) } else { name.to_string() };
         if let Some(n) = self.scene.node_mut(id) {
             n.name = unique;
         }

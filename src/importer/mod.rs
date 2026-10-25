@@ -1,6 +1,7 @@
 //! Scene importers.
 
 pub mod gltf;
+pub mod usd;
 
 use crate::app::App;
 use std::path::Path;
@@ -15,11 +16,12 @@ pub fn import_take(app: &mut App, path: &Path, take: Option<&str>) -> Result<Str
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     match ext.as_str() {
         "glb" | "gltf" => gltf::import(app, path, take).map(|r| r.summary()),
+        "usda" | "usd" | "usdc" | "usdz" => usd::import(app, path).map(|r| r.summary()),
         "obj" => {
             app.import_obj(path.to_path_buf());
             Ok(String::new())
         }
-        _ => Err(format!("Unknown import format '.{ext}' (use .glb, .gltf or .obj)")),
+        _ => Err(format!("Unknown import format '.{ext}' (use .glb, .gltf, .usd/.usda/.usdc/.usdz or .obj)")),
     }
 }
 

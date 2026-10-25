@@ -2,14 +2,14 @@
 
 A Maya-style 3D content-creation app written in Rust with **egui** (UI) and **wgpu** (viewport rendering).
 It covers the **UI, polygon and edge modeling, keyframe animation, character rigging (with deformers and a one-click
-biped Quick Rig), look development (materials, lights, cameras, shadows), glTF / USD export and an AI copilot**.
+biped Quick Rig), look development (materials, lights, cameras, shadows), a path tracer, glTF / USD import and export and an AI copilot**.
 Simulation, NURBS, UVs and Arnold rendering show up in the menus as greyed-out "planned" items.
 
 ![screenshot](docs/screenshot.png)
 
 ## Build & run (Windows / macOS / Linux)
 
-1. Install Rust 1.95 or newer from https://rustup.rs (run `rustup update` if you already have it).
+1. Install Rust 1.96 or newer from https://rustup.rs (run `rustup update` if you already have it).
 2. In this folder, run:
 
 ```
@@ -47,7 +47,7 @@ materials/lights/cameras, the glTF and USD exporters, and the AI parsers and rou
 | **Animation** | Set Key (S), Shift+W/E/R key T/R/S, Auto Keyframe, auto-clamped spline curves, Time Slider with key ticks and scrubbing, Range Slider, fps, loop, playback (Alt+V), next/previous key (, .), step frame (Alt+, Alt+.) |
 | **Graph Editor** | Curve list, key selection, tangent handles and types, insert/delete/copy/paste keys, pan and zoom (see Animation tools) |
 | **Command line / Script Editor** | A MEL-like language: `polyCube -w 2 -n box; move -r 0 1 0; setKeyframe -at tx; select p*; parent; getAttr box.tx` … type `help` for the full list |
-| **Files** | Save/Open scenes (`.rma`, JSON), Undo/Redo (100 levels), Recent Files, autosave every few minutes with crash recovery, "save changes?" prompt on New/Open/Quit, OBJ import/export (with .mtl), **glTF 2.0 import and export (.glb/.gltf)**, **USD (.usda) export**, drag-and-drop import |
+| **Files** | Save/Open scenes (`.rma`, JSON), Undo/Redo (100 levels), Recent Files, autosave every few minutes with crash recovery, "save changes?" prompt on New/Open/Quit, OBJ import/export (with .mtl), **glTF 2.0 import and export (.glb/.gltf)**, **USD export (.usda) and import (.usd/.usda/.usdc/.usdz)**, drag-and-drop import |
 | **Preferences** | Windows › Preferences: autosave interval, demo scene; layout, shading and tool options are remembered between sessions |
 
 ## Rigging
@@ -157,15 +157,42 @@ Not exported: cluster deformers in glTF (glTF has no equivalent), ambient lights
 
 ![import](docs/import.png)
 
-File › Import (glTF / OBJ)…, drag and drop a file onto the window, or `file -import path [-take animName]`:
+File › Import (glTF / USD / OBJ)…, drag and drop a file onto the window, or `file -import path [-take animName]`:
 
 | Format | What comes in |
 |---|---|
 | **glTF 2.0** (`.glb`, `.gltf` with embedded, external or data-URI buffers) | Node hierarchy (TRS or matrix), meshes (triangles, strips, fans; vertices welded so edges are connected), UVs, PBR materials with the base-colour texture (embedded images are saved to `<file>_textures/`), skins → joints + skinCluster (exact glTF bind matrices), morph targets → blend shapes (with names and default weights), the first animation (or `-take Walk`) → keyframes on translate/rotate/scale and blend weights (LINEAR, STEP and CUBICSPLINE samplers, sparse accessors), `KHR_lights_punctual` lights and perspective cameras. One undo step. |
+| **USD** (`.usd`, `.usda`, `.usdc`, `.usdz`) | See [USD import](#usd-import-v16) below. |
 | **OBJ** | Meshes with UVs, plus materials from the `.mtl` (`Kd` colour and `map_Kd` texture). |
 
-Normal maps and metallic-roughness maps are imported (v1.4); the packed glTF texture is split into roughness and metalness maps. Not imported yet: occlusion and emissive *maps*, orthographic cameras.
+Normal and metallic-roughness maps have been imported since v1.4, with the packed glTF texture split into roughness and metalness maps; occlusion and emissive maps since v1.5. Orthographic cameras are not imported yet.
 Tested against the Khronos sample models CesiumMan, Fox (3 takes), RiggedFigure, AnimatedMorphCube, BoxAnimated, BoxTextured and DamagedHelmet, and with Rust Maya's own glTF round-trip (rig, skin, blend shape, animation, texture, light, camera).
+
+### USD import (v1.6)
+
+![USD import](docs/usd_import.png)
+
+*The [OpenChessSet](https://github.com/usd-wg/assets/tree/main/full_assets/OpenChessSet) by Side Effects, artwork by Moeen Sayed and Mujtaba Sayed: binary-geometry assets with payloads, shading variants, MaterialX looks and PointInstanced pawns, imported and path-traced in Rust Maya.*
+
+`file -import stage.usd` (or `.usda`, `.usdc`, `.usdz`) builds the stage as Maya-style nodes in one undo step:
+
+| | What comes in |
+|---|---|
+| **Layers** | Text `.usda`, binary `.usdc` (read with the pure-Rust [openusd](https://crates.io/crates/openusd) crate), and `.usdz` packages, which are unpacked to a temp folder so their textures resolve. |
+| **Composition** | `subLayers`, `references` and `payload` (to other files or to prims in the same layer, with `defaultPrim`), `inherits` and `specializes`, and **variant sets** with their selections, including nested sets and selections made by the referencing prim. Opinions merge strongest first, in USD's LIVRPS order. `active = false` prims are skipped. |
+| **Geometry** | Xform hierarchy with every xformOp (translate, rotate*, orient, scale, transform, `!invert!`, animated → keys), Mesh (face-varying / vertex / uniform UVs with indices, left-handed orientation, displayColor), the intrinsic primitives Cube / Sphere / Cylinder / Cone / Capsule / Plane (with `axis`), BasisCurves, and **PointInstancer** (one group per instance with its position, orientation and scale). |
+| **Looks** | UsdPreviewSurface networks (UsdUVTexture colour, normal, roughness, metallic, occlusion, emissive maps, UsdTransform2d repeat, through NodeGraph outputs), **MaterialX** (`.mtlx` files referenced from USD and inline `ND_standard_surface` / OpenPBR shaders: base colour, metalness, roughness, normal map, emission, opacity, transmission), and materials whose colour comes from the mesh's `displayColor` primvar (each mesh gets a tinted copy). Identical materials repeated across instanced assets are shared. EXR / HDR textures load too. |
+| **Characters** | **UsdSkel**: Skeleton → joints, SkelAnimation → keys, joint influences → skinCluster, BlendShape → blend-shape targets with weight curves. |
+| **Lights, cameras, stage** | UsdLux distant / sphere / spot (ShapingAPI) / rect (area) / dome lights, cameras (focal length, clipping, depth of field), frame rate and playback range. Z-up stages and `metersPerUnit` are converted to Y-up metres. |
+
+Notes in the status line report anything skipped (for example a missing referenced file). Not supported: value clips, relocates, point-animated (time-sampled) meshes beyond the first sample, and MaterialX node graphs beyond image / normal-map chains.
+
+The importer is checked against Pixar's USD in two ways:
+
+- Every Rust Maya export round-trips: export → import → re-evaluate matches the source scene at every frame, including UsdSkel characters, and `usdcat`-reserialised copies of those exports import the same way.
+- `USD_CORPUS=<dir> cargo test --release usd_corpus -- --ignored --nocapture` imports every USD file under a folder. When a `<name>.flat.usda` copy flattened by pxr sits next to a file (`tools/usd_flatten.py <dir>` makes them), it also checks that our composed stage matches pxr's mesh count and world-space bounds. On the [usd-wg assets](https://github.com/usd-wg/assets), all 193 test and full assets import, and 192 match pxr exactly. The exception is a deliberately degenerate `timeCodesPerSecond = 0` test.
+
+The viewport splits very large scenes across several GPU vertex buffers, so million-triangle stages like the chess set display normally.
 
 ## Animation tools (v0.9)
 
@@ -319,6 +346,7 @@ src/
   prefs.rs       preferences, recent files, autosave and crash recovery
   look.rs        materials, lights, cameras, look-through, GPU light setup
   export/        glTF 2.0 (.glb/.gltf) and USD (.usda) exporters with animation baking
+  importer/      glTF 2.0 and USD (.usd/.usda/.usdc/.usdz: parser, composition, MaterialX, UsdSkel) importers
   camera.rs      persp/ortho cameras, projection, picking rays
   render.rs      wgpu renderer (offscreen MSAA + depth, shaded/line pipelines, blit into egui)
   app.rs         editor state and every undoable action
@@ -338,8 +366,8 @@ src/
 
 These items appear in the UI as disabled "planned" entries:
 - Deformers: wire
-- Modeling: Quad Draw, UV cut/sew/unfold, NURBS curves and surfaces
-- USD import, FBX, light-path passes (direct / indirect / specular)
+- Modeling: Quad Draw, NURBS curves and surfaces
+- FBX, USD value clips, light-path passes (direct / indirect / specular)
 - FX: particles, cloth, fluids
 
 *Not affiliated with Autodesk. Maya is a trademark of Autodesk, Inc.*

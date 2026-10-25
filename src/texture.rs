@@ -51,8 +51,23 @@ impl TexImage {
     pub fn load(path: &Path) -> Result<TexImage, String> {
         let img = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let src = (img.width(), img.height());
+        // Float images (EXR / HDR) hold linear values; textures are stored sRGB-encoded.
+        let rgba8 = if matches!(img.color(), image::ColorType::Rgb32F | image::ColorType::Rgba32F) {
+            let f = img.to_rgba32f();
+            let enc = |c: f32| {
+                let c = c.clamp(0.0, 1.0);
+                let s = if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+                (s * 255.0 + 0.5) as u8
+            };
+            image::RgbaImage::from_fn(f.width(), f.height(), |x, y| {
+                let p = f.get_pixel(x, y).0;
+                image::Rgba([enc(p[0]), enc(p[1]), enc(p[2]), (p[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8])
+            })
+        } else {
+            img.to_rgba8()
+        };
         // Image rows go top to bottom; UV v=0 is the bottom, so flip once here.
-        let rgba = image::imageops::flip_vertical(&img.to_rgba8());
+        let rgba = image::imageops::flip_vertical(&rgba8);
         Ok(TexImage::from_rgba(rgba, src))
     }
 

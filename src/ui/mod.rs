@@ -385,8 +385,9 @@ impl Shell {
                 }
                 Action::ImportObj => {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("All supported", &["glb", "gltf", "obj"])
+                        .add_filter("All supported", &["glb", "gltf", "usd", "usda", "usdc", "usdz", "obj"])
                         .add_filter("glTF 2.0", &["glb", "gltf"])
+                        .add_filter("USD", &["usd", "usda", "usdc", "usdz"])
                         .add_filter("Wavefront OBJ", &["obj"])
                         .pick_file()
                     {

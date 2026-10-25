@@ -59,7 +59,7 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
                 }
             });
             ui.separator();
-            if item(ui, "Import (glTF / OBJ)...", "") {
+            if item(ui, "Import (glTF / USD / OBJ)...", "") {
                 actions.push(Action::ImportObj);
             }
             if item(ui, "Export All (OBJ)...", "") {

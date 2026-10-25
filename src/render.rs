@@ -133,8 +133,11 @@ struct Target {
 }
 
 struct DynBuffer {
-    buf: Option<wgpu::Buffer>,
-    cap: u64,
+    /// Vertex buffer pages, each within the device's `max_buffer_size` (big imports can need
+    /// more than one 256 MB buffer): (buffer, capacity in bytes).
+    pages: Vec<(wgpu::Buffer, u64)>,
+    /// Vertices per full page (a multiple of 6, so triangles and lines never straddle pages).
+    page_verts: u64,
     count: u32,
     /// (chunk id, vertex offset) of what is currently in the buffer.
     uploaded: Vec<(u64, u64)>,
@@ -142,59 +145,94 @@ struct DynBuffer {
 
 impl DynBuffer {
     fn new() -> Self {
-        DynBuffer { buf: None, cap: 0, count: 0, uploaded: Vec::new() }
+        DynBuffer { pages: Vec::new(), page_verts: 0, count: 0, uploaded: Vec::new() }
     }
 
-    /// Upload a list of chunks back to back, writing only chunks that moved or changed.
-    fn upload_chunks(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, chunks: &[Arc<Chunk>]) {
+    /// Make room for `total` vertices; returns true if the pages were (re)allocated.
+    fn reserve(&mut self, device: &wgpu::Device, total: u64) -> bool {
         let vsize = std::mem::size_of::<GpuVertex>() as u64;
+        let max_bytes = device.limits().max_buffer_size.min(1 << 30);
+        let page_verts = (max_bytes / vsize / 6 * 6).max(6);
+        let pages = total.div_ceil(page_verts) as usize;
+        let last_need = (total - (pages as u64 - 1) * page_verts) * vsize;
+        let fits = self.page_verts == page_verts
+            && self.pages.len() == pages
+            && self.pages.last().is_some_and(|(_, cap)| *cap >= last_need)
+            && self.pages[..pages - 1].iter().all(|(_, cap)| *cap >= page_verts * vsize);
+        if fits {
+            return false;
+        }
+        self.page_verts = page_verts;
+        self.pages = (0..pages)
+            .map(|i| {
+                let size = if i + 1 < pages { page_verts * vsize } else { last_need.next_power_of_two().max(4096).min(page_verts * vsize) };
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rm_vertices"),
+                    size,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                (buf, size)
+            })
+            .collect();
+        true
+    }
+
+    /// Write vertices starting at a global vertex offset (split across pages as needed).
+    fn write(&self, queue: &wgpu::Queue, mut off: u64, mut data: &[GpuVertex]) {
+        let vsize = std::mem::size_of::<GpuVertex>() as u64;
+        while !data.is_empty() {
+            let page = (off / self.page_verts) as usize;
+            let local = off % self.page_verts;
+            let n = ((self.page_verts - local) as usize).min(data.len());
+            queue.write_buffer(&self.pages[page].0, local * vsize, bytemuck::cast_slice(&data[..n]));
+            data = &data[n..];
+            off += n as u64;
+        }
+    }
+
+    fn upload_chunks(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, chunks: &[Arc<Chunk>]) {
         let total: u64 = chunks.iter().map(|c| c.data.len() as u64).sum();
         self.count = total as u32;
         if total == 0 {
             return;
         }
-        let need = total * vsize;
-        if self.buf.is_none() || self.cap < need {
-            let cap = need.next_power_of_two().max(4096);
-            self.buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rm_vertices"),
-                size: cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.cap = cap;
+        if self.reserve(device, total) {
             self.uploaded.clear();
         }
-        let buf = self.buf.as_ref().unwrap();
         let mut off = 0u64;
         let mut now = Vec::with_capacity(chunks.len());
         for (i, c) in chunks.iter().enumerate() {
             if !c.data.is_empty() && self.uploaded.get(i) != Some(&(c.id, off)) {
-                queue.write_buffer(buf, off * vsize, bytemuck::cast_slice(&c.data));
+                self.write(queue, off, &c.data);
             }
             now.push((c.id, off));
             off += c.data.len() as u64;
         }
         self.uploaded = now;
     }
+
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[GpuVertex]) {
         self.count = data.len() as u32;
         if data.is_empty() {
             return;
         }
-        let bytes: &[u8] = bytemuck::cast_slice(data);
-        let need = bytes.len() as u64;
-        if self.buf.is_none() || self.cap < need {
-            let cap = need.next_power_of_two().max(4096);
-            self.buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rm_vertices"),
-                size: cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.cap = cap;
+        self.reserve(device, data.len() as u64);
+        self.write(queue, 0, data);
+    }
+
+    /// Draw all vertices (one draw per page).
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let mut left = self.count as u64;
+        for (buf, _) in &self.pages {
+            if left == 0 {
+                break;
+            }
+            let n = left.min(self.page_verts);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..n as u32, 0..1);
+            left -= n;
         }
-        queue.write_buffer(self.buf.as_ref().unwrap(), 0, bytes);
     }
 }
 
@@ -934,8 +972,7 @@ impl egui_wgpu::CallbackTrait for ViewCallback {
             pass.set_pipeline(&r.shadow_pipeline);
             pass.set_bind_group(0, &r.shadow_uniform_bg, &[]);
             if r.tris.count > 0 {
-                pass.set_vertex_buffer(0, r.tris.buf.as_ref().unwrap().slice(..));
-                pass.draw(0..r.tris.count, 0..1);
+                r.tris.draw(&mut pass);
             }
         }
         r.ensure_target(device, self.view_id, size);
@@ -1019,25 +1056,21 @@ impl egui_wgpu::CallbackTrait for ViewCallback {
                 let opaque = if self.xray { &r.tri_blend_pipeline } else { &r.tri_pipeline };
                 if r.tris.count > 0 {
                     pass.set_pipeline(opaque);
-                    pass.set_vertex_buffer(0, r.tris.buf.as_ref().unwrap().slice(..));
-                    pass.draw(0..r.tris.count, 0..1);
+                    r.tris.draw(&mut pass);
                 }
                 if r.tris_transp.count > 0 {
                     pass.set_pipeline(&r.tri_blend_pipeline);
-                    pass.set_vertex_buffer(0, r.tris_transp.buf.as_ref().unwrap().slice(..));
-                    pass.draw(0..r.tris_transp.count, 0..1);
+                    r.tris_transp.draw(&mut pass);
                 }
             }
             pass.set_pipeline(&r.line_pipeline);
             let wire = if self.draw_wire_all { &r.wire_all } else { &r.wire_sel };
             if wire.count > 0 {
-                pass.set_vertex_buffer(0, wire.buf.as_ref().unwrap().slice(..));
-                pass.draw(0..wire.count, 0..1);
+                wire.draw(&mut pass);
             }
             if r.overlay.count > 0 {
                 pass.set_pipeline(&r.overlay_pipeline);
-                pass.set_vertex_buffer(0, r.overlay.buf.as_ref().unwrap().slice(..));
-                pass.draw(0..r.overlay.count, 0..1);
+                r.overlay.draw(&mut pass);
             }
         }
         Vec::new()
