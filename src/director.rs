@@ -25,7 +25,7 @@ pub const CAMERAS: [(&str, &str); 5] = [
     ("orbit", "circles the subject"),
     ("crane", "rises up and back"),
 ];
-pub const FX: [(&str, &str); 8] = [
+pub const FX: [(&str, &str); 11] = [
     ("rain", "falling rain"),
     ("snow", "drifting snowflakes"),
     ("sparks", "a burst of sparks"),
@@ -34,6 +34,9 @@ pub const FX: [(&str, &str); 8] = [
     ("leaves", "falling leaves"),
     ("cape", "a cloth cape pinned to the character's chest"),
     ("flag", "a flag on a pole in the wind"),
+    ("smoke", "a rising column of smoke (voxel fluid)"),
+    ("fire", "a campfire with glowing flames and smoke (voxel fluid)"),
+    ("explosion", "a fiery explosion (voxel fluid)"),
 ];
 
 // ------------------------------------------------------------------------------ character
@@ -427,6 +430,21 @@ impl App {
             "leaves" => vol(self, ParticleSettings { rate: (a * a * 0.15).min(600.0), gravity: Vec3::new(0.0, -1.5, 0.0), drag: 1.5, wind: windv + Vec3::new(0.6, 0.0, 0.2), turbulence: 2.0, turbulence_freq: 0.5, lifespan: 10.0, radius: 0.05, color: [0.95, 0.55, 0.12], color_end: [0.55, 0.25, 0.08], bounce: 0.0, friction: 1.0, ..base }, 6.0, 0.3, "leaves", a * 0.4),
             "dust" => vol(self, ParticleSettings { rate: (a * a * 0.5).min(1200.0), gravity: Vec3::new(0.0, -0.15, 0.0), drag: 1.0, wind: Vec3::new(2.5, 0.0, 0.4) + windv, turbulence: 1.0, turbulence_freq: 0.8, lifespan: 6.0, radius: 0.02, color: [0.85, 0.72, 0.52], color_end: [0.7, 0.6, 0.45], ..base }, 0.8, 1.2, "dust", a * 0.4),
             "fireflies" => vol(self, ParticleSettings { rate: 25.0, gravity: Vec3::ZERO, drag: 1.0, turbulence: 1.5, turbulence_freq: 0.7, lifespan: 6.0, radius: 0.03, color: [1.0, 0.95, 0.35], color_end: [0.6, 1.0, 0.25], ground: false, ..base }, 1.2, 1.6, "fireflies", a * 0.25),
+            "smoke" | "fire" | "explosion" => {
+                // Beside the subject (or at the origin) on the ground.
+                let p = subject.and_then(|s| self.world_bounds(&[s])).map(|(lo, hi)| Vec3::new(hi.x + 1.2, lo.y.max(0.0), (lo.z + hi.z) * 0.5)).unwrap_or(Vec3::ZERO);
+                crate::commands::execute(self, &format!("spaceLocator -n {name}Source"))?;
+                let loc = self.sel[0];
+                if let Some(n) = self.scene.node_mut(loc) {
+                    n.translate = p + Vec3::Y * 0.25;
+                }
+                let id = self.fluid_preset(name, Some(loc), Some(name))?;
+                if wind {
+                    let w = crate::fx::Field { magnitude: 3.0, direction: Vec3::X, ..crate::fx::Field::new(crate::fx::FieldKind::Air) };
+                    self.create_field(w, None, Some(&format!("{name}Wind")), vec![id])?;
+                }
+                Ok(id)
+            }
             "sparks" => {
                 let p = subject.and_then(|s| self.world_bounds(&[s])).map(|(lo, hi)| Vec3::new((lo.x + hi.x) * 0.5 + 0.8, 0.05, (lo.z + hi.z) * 0.5)).unwrap_or(Vec3::new(1.0, 0.05, 0.0));
                 let s = ParticleSettings { kind: EmitterKind::Directional, dir: Vec3::Y, spread: 35.0, rate: 300.0, speed: 4.5, speed_random: 0.4, lifespan: 1.4, lifespan_random: 0.4, drag: 0.2, wind: windv, radius: 0.012, color: [1.0, 0.9, 0.4], color_end: [1.0, 0.25, 0.05], bounce: 0.45, ..Default::default() };
@@ -635,7 +653,10 @@ pub fn parse_shot(text: &str) -> ShotSpec {
     .unwrap_or_else(|| if s.subject.is_some() { "track".into() } else { "orbit".into() });
     for (keys, fx) in [
         (&["rain", "raining", "rainy", "storm", "stormy", "drizzle"][..], "rain"),
-        (&["sparks", "sparkling", "welding", "fire", "fireworks"][..], "sparks"),
+        (&["sparks", "sparkling", "welding", "fireworks"][..], "sparks"),
+        (&["fire", "campfire", "bonfire", "flames", "burning"][..], "fire"),
+        (&["smoke", "smoky", "smoking", "chimney"][..], "smoke"),
+        (&["explosion", "explode", "explodes", "exploding", "blast", "kaboom"][..], "explosion"),
         (&["fireflies", "firefly", "magic", "magical", "glowing"][..], "fireflies"),
         (&["dust", "dusty", "sandstorm", "haze", "hazy", "foggy", "fog", "mist", "misty"][..], "dust"),
         (&["leaves", "autumn", "fall", "falling"][..], "leaves"),
@@ -767,7 +788,7 @@ pub fn mel(app: &mut App, tokens: &[String]) -> Option<Result<String, String>> {
             Ok(app.scene.node(id).map(|n| n.name.clone()).unwrap_or_default())
         })(),
         "fxPreset" => (|| {
-            let name = t.iter().find(|x| !x.starts_with('-')).cloned().ok_or("fxPreset rain|snow|sparks|fireflies|dust|leaves|cape|flag")?;
+            let name = t.iter().find(|x| !x.starts_with('-')).cloned().ok_or("fxPreset rain|snow|sparks|fireflies|dust|leaves|cape|flag|smoke|fire|explosion")?;
             let wind = flag(&mut t, &["wind", "w"]);
             let subj = app.sel.iter().copied().find(|i| app.scene.node(*i).is_some_and(|n| n.mesh().is_some()));
             let id = app.create_fx_preset(&name, 24.0, subj, wind)?;

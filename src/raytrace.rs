@@ -12,7 +12,7 @@
 
 use crate::render::FrameGeometry;
 use crate::texture::{TEX_SIZE, TexImage};
-use glam::{Vec2, Vec3};
+use glam::{Vec2, Vec3, Mat3, Mat4};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -228,6 +228,304 @@ enum RtLight {
     Spot { pos: Vec3, axis: Vec3, cos_outer: f32, cos_inner: f32, rad: Vec3 },
     /// Rectangle centre ± ex ± ey, emitting along `n` (one-sided).
     Area { c: Vec3, ex: Vec3, ey: Vec3, n: Vec3, area: f32, rad: Vec3 },
+    /// The glowing voxels of a fire volume (sampled by emitted power).
+    Volume { v: usize },
+}
+
+/// A smoke / fire volume (participating medium on a voxel grid).
+struct RtVolume {
+    /// World → continuous grid coordinates (cell centres at integers).
+    to_index: Mat4,
+    to_world: Mat4,
+    dims: [usize; 3],
+    /// Extinction per world unit.
+    sigma: Vec<f32>,
+    /// Emitted radiance per world unit (fire).
+    emission: Vec<Vec3>,
+    albedo: Vec3,
+    g: f32,
+    majorant: f32,
+    /// Per-brick majorants (BRICK³ voxels each, padded by one voxel for interpolation), so
+    /// tracking takes big steps through thin or empty regions.
+    bricks: [usize; 3],
+    brick_maj: Vec<f32>,
+    /// Emitting voxels with their cumulative power (light sampling).
+    em_idx: Vec<u32>,
+    em_cdf: Vec<f32>,
+    em_total: f32,
+    voxel_volume: f32,
+    /// Object id (ID passes / mattes).
+    obj: u32,
+}
+
+impl RtVolume {
+    fn new(v: &crate::fluid::VolumeGeom, obj: u32) -> RtVolume {
+        let [nx, ny, nz] = v.dims;
+        let origin = -Vec3::new(nx as f32, ny as f32, nz as f32) * v.h * 0.5 + Vec3::splat(v.h * 0.5);
+        let to_world = v.world * Mat4::from_translation(origin) * Mat4::from_scale(Vec3::splat(v.h));
+        // A light [1 2 1] smoothing hides the voxel structure of steep fronts.
+        let sigma: Vec<f32> = smooth3(v.dims, &v.density).iter().map(|d| (d * v.density_scale).max(0.0)).collect();
+        let emission: Vec<Vec3> = smooth3(v.dims, &v.temp).iter().map(|&t| crate::fluid::fire_emission(t, v.fire_temp, v.fire_color, v.fire_intensity)).collect();
+        let majorant = sigma.iter().fold(0.0f32, |a, &b| a.max(b));
+        let [nx, ny, nz] = v.dims;
+        let bricks = [nx.div_ceil(BRICK), ny.div_ceil(BRICK), nz.div_ceil(BRICK)];
+        let mut brick_maj = vec![0.0f32; bricks[0] * bricks[1] * bricks[2]];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let sv = sigma[x + nx * (y + ny * z)];
+                    if sv <= 0.0 {
+                        continue;
+                    }
+                    // A voxel influences lookups up to one voxel away.
+                    for bz in (z.saturating_sub(1) / BRICK)..=((z + 1).min(nz - 1) / BRICK) {
+                        for by in (y.saturating_sub(1) / BRICK)..=((y + 1).min(ny - 1) / BRICK) {
+                            for bx in (x.saturating_sub(1) / BRICK)..=((x + 1).min(nx - 1) / BRICK) {
+                                let k = bx + bricks[0] * (by + bricks[1] * bz);
+                                brick_maj[k] = brick_maj[k].max(sv);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let w3 = Mat3::from_mat4(to_world);
+        let voxel_volume = w3.determinant().abs();
+        let (mut em_idx, mut em_cdf, mut acc) = (Vec::new(), Vec::new(), 0.0);
+        for (i, e) in emission.iter().enumerate() {
+            let p = lum(*e);
+            if p > 1e-6 {
+                acc += p;
+                em_idx.push(i as u32);
+                em_cdf.push(acc);
+            }
+        }
+        RtVolume { to_index: to_world.inverse(), to_world, dims: v.dims, sigma, emission, albedo: Vec3::from(v.smoke_color), g: v.anisotropy, majorant, bricks, brick_maj, em_idx, em_cdf, em_total: acc, voxel_volume, obj }
+    }
+
+    fn idx(&self, x: usize, y: usize, z: usize) -> usize {
+        x + self.dims[0] * (y + self.dims[1] * z)
+    }
+
+    /// Trilinear lookup at grid coordinates (zero outside).
+    fn lookup<T: Copy + Default + std::ops::Mul<f32, Output = T> + std::ops::Add<Output = T>>(&self, f: &[T], p: Vec3) -> T {
+        let [nx, ny, nz] = self.dims;
+        if p.x < -0.5 || p.y < -0.5 || p.z < -0.5 || p.x > nx as f32 - 0.5 || p.y > ny as f32 - 0.5 || p.z > nz as f32 - 0.5 {
+            return T::default();
+        }
+        let q = p.clamp(Vec3::ZERO, Vec3::new(nx as f32 - 1.0, ny as f32 - 1.0, nz as f32 - 1.0));
+        let (x0, y0, z0) = (q.x.floor() as usize, q.y.floor() as usize, q.z.floor() as usize);
+        let (x1, y1, z1) = ((x0 + 1).min(nx - 1), (y0 + 1).min(ny - 1), (z0 + 1).min(nz - 1));
+        let (fx, fy, fz) = (q.x - x0 as f32, q.y - y0 as f32, q.z - z0 as f32);
+        let v = |x, y, z| f[self.idx(x, y, z)];
+        let l = |a: T, b: T, t: f32| a * (1.0 - t) + b * t;
+        l(l(l(v(x0, y0, z0), v(x1, y0, z0), fx), l(v(x0, y1, z0), v(x1, y1, z0), fx), fy), l(l(v(x0, y0, z1), v(x1, y0, z1), fx), l(v(x0, y1, z1), v(x1, y1, z1), fx), fy), fz)
+    }
+
+    /// World ray (o + d·t) → grid-space ray and its [t0, t1] overlap with the grid box.
+    fn span(&self, o: Vec3, d: Vec3, tmax: f32) -> Option<(Vec3, Vec3, f32, f32)> {
+        let oi = self.to_index.transform_point3(o);
+        let di = self.to_index.transform_vector3(d);
+        let lo = Vec3::splat(-0.5);
+        let hi = Vec3::new(self.dims[0] as f32, self.dims[1] as f32, self.dims[2] as f32) - Vec3::splat(0.5);
+        let (mut t0, mut t1) = (0.0f32, tmax);
+        for a in 0..3 {
+            if di[a].abs() < 1e-12 {
+                if oi[a] < lo[a] || oi[a] > hi[a] {
+                    return None;
+                }
+                continue;
+            }
+            let (ta, tb) = ((lo[a] - oi[a]) / di[a], (hi[a] - oi[a]) / di[a]);
+            t0 = t0.max(ta.min(tb));
+            t1 = t1.min(ta.max(tb));
+        }
+        (t1 > t0).then_some((oi, di, t0, t1))
+    }
+
+    /// Walk the bricks a grid-space ray crosses between t0 and t1 (3D DDA), calling
+    /// `f(segment start, segment end, brick majorant)`; `f` returns false to stop.
+    fn walk(&self, oi: Vec3, di: Vec3, t0: f32, t1: f32, mut f: impl FnMut(f32, f32, f32) -> bool) {
+        let b = BRICK as f32;
+        // Brick coordinates: index box starts at -0.5.
+        let q = |t: f32| (oi + di * t + Vec3::splat(0.5)) / b;
+        let start = q(t0 + (t1 - t0) * 1e-6);
+        let mut cell = [0i64; 3];
+        let mut step = [0i64; 3];
+        let mut next = [f32::INFINITY; 3];
+        let mut delta = [f32::INFINITY; 3];
+        for a in 0..3 {
+            cell[a] = (start[a].floor() as i64).clamp(0, self.bricks[a] as i64 - 1);
+            let dq = di[a] / b;
+            if dq > 1e-12 {
+                step[a] = 1;
+                delta[a] = 1.0 / dq;
+                next[a] = t0 + ((cell[a] + 1) as f32 - q(t0)[a]) / dq;
+            } else if dq < -1e-12 {
+                step[a] = -1;
+                delta[a] = -1.0 / dq;
+                next[a] = t0 + (cell[a] as f32 - q(t0)[a]) / dq;
+            }
+        }
+        let mut t = t0;
+        for _ in 0..10_000 {
+            let a = if next[0] <= next[1] && next[0] <= next[2] { 0 } else if next[1] <= next[2] { 1 } else { 2 };
+            let te = next[a].min(t1);
+            let k = cell[0] as usize + self.bricks[0] * (cell[1] as usize + self.bricks[1] * cell[2] as usize);
+            if te > t && !f(t, te, self.brick_maj[k]) {
+                return;
+            }
+            if te >= t1 {
+                return;
+            }
+            t = te;
+            cell[a] += step[a];
+            next[a] += delta[a];
+            if cell[a] < 0 || cell[a] >= self.bricks[a] as i64 {
+                return;
+            }
+        }
+    }
+
+    /// Delta tracking: distance to a real scattering event before `tmax`, if any.
+    fn collide(&self, o: Vec3, d: Vec3, tmax: f32, rng: &mut Rng) -> Option<f32> {
+        if self.majorant <= 0.0 {
+            return None;
+        }
+        let (oi, di, t0, t1) = self.span(o, d, tmax)?;
+        let mut hit = None;
+        self.walk(oi, di, t0, t1, |a, b, m| {
+            if m <= 0.0 {
+                return true;
+            }
+            let mut t = a;
+            for _ in 0..1024 {
+                t -= (1.0 - rng.f()).max(1e-12).ln() / m;
+                if t >= b {
+                    return true;
+                }
+                if rng.f() * m < self.lookup(&self.sigma, oi + di * t) {
+                    hit = Some(t);
+                    return false;
+                }
+            }
+            true
+        });
+        hit
+    }
+
+    /// Ratio-tracking transmittance along o→o+d·tmax.
+    fn transmittance(&self, o: Vec3, d: Vec3, tmax: f32, rng: &mut Rng) -> f32 {
+        if self.majorant <= 0.0 {
+            return 1.0;
+        }
+        let Some((oi, di, t0, t1)) = self.span(o, d, tmax) else { return 1.0 };
+        let mut tr = 1.0f32;
+        self.walk(oi, di, t0, t1, |a, b, m| {
+            if m <= 0.0 {
+                return true;
+            }
+            let mut t = a;
+            for _ in 0..1024 {
+                t -= (1.0 - rng.f()).max(1e-12).ln() / m;
+                if t >= b {
+                    return true;
+                }
+                tr *= 1.0 - self.lookup(&self.sigma, oi + di * t) / m;
+                if tr < 0.02 {
+                    // Russian roulette keeps it unbiased.
+                    if rng.f() < 0.5 {
+                        tr = 0.0;
+                        return false;
+                    }
+                    tr *= 2.0;
+                }
+            }
+            true
+        });
+        tr
+    }
+
+    /// Fire seen along a ray: ∫ T(t) e(t) dt by jittered ray marching.
+    fn emitted(&self, o: Vec3, d: Vec3, tmax: f32, rng: &mut Rng) -> Vec3 {
+        if self.em_total <= 0.0 {
+            return Vec3::ZERO;
+        }
+        let Some((oi, di, t0, t1)) = self.span(o, d, tmax) else { return Vec3::ZERO };
+        let step = 0.6 / di.length().max(1e-9);
+        let mut t = t0 + step * rng.f();
+        let mut tr = 1.0f32;
+        let mut sum = Vec3::ZERO;
+        while t < t1 && tr > 1e-3 {
+            let p = oi + di * t;
+            let e = self.lookup(&self.emission, p);
+            sum += e * (tr * step);
+            tr *= (-self.lookup(&self.sigma, p) * step).exp();
+            t += step;
+        }
+        sum
+    }
+
+    /// A point on the fire for light sampling: (world position, emitted intensity / pdf).
+    fn sample_emitter(&self, rng: &mut Rng) -> Option<(Vec3, Vec3)> {
+        if self.em_total <= 0.0 {
+            return None;
+        }
+        let r = rng.f() * self.em_total;
+        let k = self.em_cdf.partition_point(|&c| c < r).min(self.em_idx.len() - 1);
+        let i = self.em_idx[k] as usize;
+        let p_k = (self.em_cdf[k] - if k > 0 { self.em_cdf[k - 1] } else { 0.0 }) / self.em_total;
+        let (x, y, z) = (i % self.dims[0], (i / self.dims[0]) % self.dims[1], i / (self.dims[0] * self.dims[1]));
+        let pi = Vec3::new(x as f32 + rng.f() - 0.5, y as f32 + rng.f() - 0.5, z as f32 + rng.f() - 0.5);
+        Some((self.to_world.transform_point3(pi), self.emission[i] * (self.voxel_volume / p_k.max(1e-12))))
+    }
+}
+
+/// Separable [1 2 1] / 4 blur of a grid (edges clamp).
+fn smooth3(dims: [usize; 3], f: &[f32]) -> Vec<f32> {
+    let [nx, ny, nz] = dims;
+    if f.len() != nx * ny * nz {
+        return f.to_vec();
+    }
+    let mut cur = f.to_vec();
+    for axis in 0..3 {
+        let stride = [1, nx, nx * ny][axis];
+        let n = dims[axis];
+        let mut out = vec![0.0f32; cur.len()];
+        for (i, o) in out.iter_mut().enumerate() {
+            let c = (i / stride) % n;
+            let lo = if c > 0 { cur[i - stride] } else { cur[i] };
+            let hi = if c + 1 < n { cur[i + stride] } else { cur[i] };
+            *o = 0.25 * lo + 0.5 * cur[i] + 0.25 * hi;
+        }
+        cur = out;
+    }
+    cur
+}
+
+/// Voxels per majorant brick side.
+const BRICK: usize = 4;
+
+/// Henyey–Greenstein phase function for the angle between propagation `d` and `wi`.
+fn hg(cos: f32, g: f32) -> f32 {
+    let d = 1.0 + g * g - 2.0 * g * cos;
+    (1.0 - g * g) / (4.0 * PI * d * d.max(1e-6).sqrt())
+}
+
+/// Sample a new propagation direction around `d` from Henyey–Greenstein.
+fn sample_hg(d: Vec3, g: f32, rng: &mut Rng) -> Vec3 {
+    let (u1, u2) = (rng.f(), rng.f());
+    let cos = if g.abs() < 1e-3 {
+        1.0 - 2.0 * u1
+    } else {
+        let s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u1);
+        (1.0 + g * g - s * s) / (2.0 * g)
+    }
+    .clamp(-1.0, 1.0);
+    let sin = (1.0 - cos * cos).max(0.0).sqrt();
+    let phi = 2.0 * PI * u2;
+    let (t, b) = basis(d);
+    (t * (sin * phi.cos()) + b * (sin * phi.sin()) + d * cos).normalize_or(d)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -256,6 +554,14 @@ pub struct RtScene {
     /// Scene uses the default key light (no direct lights in the scene).
     pub default_light: bool,
     pub tri_count: usize,
+    /// Node of each object index (index = object id − 1), for ID passes and mattes.
+    pub obj_nodes: Vec<crate::scene::NodeId>,
+    /// Material group of each object index (same indexing), filled in by the app: the
+    /// assigned material's id + 1, or 0 for the default per-object material.
+    pub obj_mats: Vec<u32>,
+    volumes: Vec<RtVolume>,
+    /// Object ids before the volumes (surface chunks).
+    surface_objs: u32,
 }
 
 fn srgb(c: [f32; 3]) -> Vec3 {
@@ -285,6 +591,9 @@ impl RtScene {
         };
         let mut moving = false;
         for (ci, chunk) in g.tris.iter().chain(&g.tris_transp).enumerate() {
+            if chunk.preview {
+                continue;
+            }
             let end = ends.get(ci).filter(|e| e.data.len() == chunk.data.len()).map(|e| &e.data);
             for (k, t) in chunk.data.chunks_exact(3).enumerate() {
                 let (a, b, c) = (Vec3::from(t[0].pos), Vec3::from(t[1].pos), Vec3::from(t[2].pos));
@@ -404,9 +713,94 @@ impl RtScene {
             tris1.clear();
             n1.clear();
         }
-        let mut s = RtScene { tris, tris1, n1, shade, mats, nodes: Vec::new(), lights, ambient, textures, default_light, tri_count };
+        let obj_nodes = if g.tri_nodes.len() == g.tris.len() && g.transp_nodes.len() == g.tris_transp.len() { g.tri_nodes.iter().chain(&g.transp_nodes).copied().collect() } else { Vec::new() };
+        let surface_objs = (g.tris.len() + g.tris_transp.len()) as u32;
+        let mut s = RtScene { tris, tris1, n1, shade, mats, nodes: Vec::new(), lights, ambient, textures, default_light, tri_count, obj_nodes, obj_mats: Vec::new(), volumes: Vec::new(), surface_objs };
+        s.set_volumes(&g.volumes);
         s.build_bvh();
         s
+    }
+
+    /// Smoke / fire volumes (replaces any previous ones). Motion-blurred renders take them
+    /// from the middle of the shutter.
+    pub fn set_volumes(&mut self, vols: &[Arc<crate::fluid::VolumeGeom>]) {
+        let n = self.surface_objs as usize;
+        self.lights.retain(|l| !matches!(l, RtLight::Volume { .. }));
+        if self.obj_nodes.len() >= n {
+            self.obj_nodes.truncate(n);
+            self.obj_nodes.extend(vols.iter().map(|v| v.node));
+        }
+        self.volumes = vols.iter().enumerate().map(|(i, v)| RtVolume::new(v, self.surface_objs + i as u32 + 1)).collect();
+        for (i, v) in self.volumes.iter().enumerate() {
+            if v.em_total > 0.0 {
+                self.lights.push(RtLight::Volume { v: i });
+            }
+        }
+    }
+
+    /// The first real scattering event in any volume before `tmax`: (distance, volume).
+    fn volume_collision(&self, o: Vec3, d: Vec3, tmax: f32, rng: &mut Rng) -> Option<(f32, usize)> {
+        let mut best: Option<(f32, usize)> = None;
+        for (i, v) in self.volumes.iter().enumerate() {
+            let lim = best.map_or(tmax, |b| b.0);
+            if let Some(t) = v.collide(o, d, lim, rng) {
+                best = Some((t, i));
+            }
+        }
+        best
+    }
+
+    fn volume_transmittance(&self, o: Vec3, d: Vec3, tmax: f32, rng: &mut Rng) -> f32 {
+        let mut tr = 1.0;
+        for v in &self.volumes {
+            tr *= v.transmittance(o, d, tmax, rng);
+            if tr <= 0.0 {
+                break;
+            }
+        }
+        tr
+    }
+
+    /// A light sample seen from `po`: (direction to the light, distance, incoming radiance
+    /// scale before the BSDF).
+    fn light_sample(&self, light: &RtLight, po: Vec3, rng: &mut Rng) -> Option<(Vec3, f32, Vec3)> {
+        Some(match *light {
+            RtLight::Dir { dir_to_light, rad } => (dir_to_light, f32::MAX, rad),
+            RtLight::Point { pos, rad } => {
+                let dv = pos - po;
+                let dd = dv.length();
+                (dv / dd.max(1e-6), dd, rad)
+            }
+            RtLight::Spot { pos, axis, cos_outer, cos_inner, rad } => {
+                let dv = pos - po;
+                let dd = dv.length();
+                let wi = dv / dd.max(1e-6);
+                let ca = (-wi).dot(axis);
+                let x = ((ca - cos_outer) / (cos_inner - cos_outer)).clamp(0.0, 1.0);
+                (wi, dd, rad * (x * x * (3.0 - 2.0 * x)))
+            }
+            RtLight::Area { c, ex, ey, n, area, rad } => {
+                let pl = c + ex * (2.0 * rng.f() - 1.0) + ey * (2.0 * rng.f() - 1.0);
+                let dv = pl - po;
+                let d2 = dv.length_squared().max(1e-8);
+                let dd = d2.sqrt();
+                let wi = dv / dd;
+                let cos_l = n.dot(-wi);
+                if cos_l <= 0.0 {
+                    return None;
+                }
+                // Uniform area sampling: L · cosθ_light · A / d².
+                (wi, dd * (1.0 - 1e-4), rad * (cos_l * area / d2))
+            }
+            RtLight::Volume { v } => {
+                let (pl, intensity) = self.volumes.get(v)?.sample_emitter(rng)?;
+                let dv = pl - po;
+                // Clamp the distance so a point inside the flame doesn't blow up.
+                let d2 = dv.length_squared().max(0.05);
+                let dd = dv.length().max(1e-4);
+                (dv / dd, dd * (1.0 - 1e-4), intensity / d2)
+            }
+        })
     }
 
     // -------------------------------------------------------------------------- BVH
@@ -595,7 +989,15 @@ impl RtScene {
     }
 
     /// Transmission along a shadow ray (1 = unblocked; transparent surfaces let light through).
-    fn transmission(&self, mut o: Vec3, d: Vec3, mut dist: f32, time: f32) -> f32 {
+    fn transmission(&self, o: Vec3, d: Vec3, dist: f32, time: f32, rng: &mut Rng) -> f32 {
+        let tr = self.surface_transmission(o, d, dist, time);
+        if tr <= 0.0 || self.volumes.is_empty() {
+            return tr;
+        }
+        tr * self.volume_transmittance(o, d, dist.min(1e6), rng)
+    }
+
+    fn surface_transmission(&self, mut o: Vec3, d: Vec3, mut dist: f32, time: f32) -> f32 {
         let mut tr = 1.0;
         for _ in 0..8 {
             let Some((t, i, _, _)) = self.intersect(o, d, dist, time) else { return tr };
@@ -782,10 +1184,6 @@ impl Surface {
     }
 
     /// Sample a direction; also says whether the specular lobe was chosen.
-    fn sample(&self, wo: Vec3, rng: &mut Rng) -> Option<Vec3> {
-        self.sample_lobe(wo, rng).map(|x| x.0)
-    }
-
     fn sample_lobe(&self, wo: Vec3, rng: &mut Rng) -> Option<(Vec3, bool)> {
         let (t, b) = basis(self.n);
         let (u1, u2) = (rng.f(), rng.f());
@@ -854,13 +1252,99 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
         PathCat::Specular => lobes.specular += c,
     };
     let mut thr = Vec3::ONE;
-    let mut alpha = 0.0;
+    let mut alpha = 0.0f32;
     let mut depth = 0u32;
     let mut passes = 0u32;
     let mut primary = true;
     let mut dist_acc = 0.0f32;
+    let vol_lights = sc.lights.iter().any(|l| matches!(l, RtLight::Volume { .. }));
+    // The last bounce came from a specular lobe (fire must then be seen directly, since light
+    // sampling can't reach it through a mirror).
+    let mut last_spec = false;
     loop {
-        let Some((t, ti, u, v)) = sc.intersect(o, d, f32::MAX, time) else {
+        let hit = sc.intersect(o, d, f32::MAX, time);
+        if !sc.volumes.is_empty() {
+            let tsurf = hit.map_or(1e6, |h| h.0.min(1e6));
+            // Fire along the ray (diffuse bounces get it through light sampling instead).
+            if cat == PathCat::Camera || last_spec || !vol_lights {
+                let mut e = Vec3::ZERO;
+                for vol in &sc.volumes {
+                    e += vol.emitted(o, d, tsurf, rng);
+                }
+                if e.max_element() > 0.0 {
+                    let mut c = thr * e;
+                    if depth > 0 {
+                        let m = c.max_element();
+                        if m > s.clamp {
+                            c *= s.clamp / m;
+                        }
+                    }
+                    if cat == PathCat::Camera {
+                        lobes.emission += c;
+                    } else {
+                        add(&mut lobes, cat, c);
+                    }
+                    if primary {
+                        alpha = alpha.max(lum(e).min(1.0));
+                    }
+                }
+            }
+            // Smoke: scatter at a real collision before the surface.
+            if let Some((tv, vi)) = sc.volume_collision(o, d, tsurf, rng) {
+                let vol = &sc.volumes[vi];
+                let p = o + d * tv;
+                if primary {
+                    alpha = 1.0;
+                    aov.albedo = vol.albedo;
+                    aov.normal = -d;
+                    aov.obj = vol.obj;
+                    aov.depth = dist_acc + tv;
+                }
+                primary = false;
+                for light in &sc.lights {
+                    let Some((wi, dist, rad)) = sc.light_sample(light, p, rng) else { continue };
+                    if rad.max_element() <= 0.0 {
+                        continue;
+                    }
+                    let tr = sc.transmission(p, wi, dist, time, rng);
+                    if tr > 0.0 {
+                        let mut c = thr * vol.albedo * rad * (hg(d.dot(wi), vol.g) * tr);
+                        if depth > 0 {
+                            let m = c.max_element();
+                            if m > s.clamp {
+                                c *= s.clamp / m;
+                            }
+                        }
+                        if cat == PathCat::Camera {
+                            lobes.diffuse_direct += c;
+                        } else {
+                            add(&mut lobes, cat, c);
+                        }
+                    }
+                }
+                if depth >= s.bounces {
+                    break;
+                }
+                let nd = sample_hg(d, vol.g, rng);
+                thr *= vol.albedo;
+                depth += 1;
+                if cat == PathCat::Camera {
+                    cat = PathCat::Diffuse;
+                }
+                last_spec = false;
+                if depth >= 3 {
+                    let q = thr.max_element().clamp(0.05, 0.95);
+                    if rng.f() > q {
+                        break;
+                    }
+                    thr /= q;
+                }
+                o = p;
+                d = nd;
+                continue;
+            }
+        }
+        let Some((t, ti, u, v)) = hit else {
             if primary {
                 if s.env_background {
                     let c = sc.sky(d, s.env);
@@ -974,35 +1458,7 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
         let po = p + ng * (EPS * 10.0 * (1.0 + p.abs().max_element() * 1e-3));
         // Next-event estimation for the delta lights.
         for light in &sc.lights {
-            let (wi, dist, rad) = match *light {
-                RtLight::Dir { dir_to_light, rad } => (dir_to_light, f32::MAX, rad),
-                RtLight::Point { pos, rad } => {
-                    let dv = pos - po;
-                    let dd = dv.length();
-                    (dv / dd.max(1e-6), dd, rad)
-                }
-                RtLight::Spot { pos, axis, cos_outer, cos_inner, rad } => {
-                    let dv = pos - po;
-                    let dd = dv.length();
-                    let wi = dv / dd.max(1e-6);
-                    let ca = (-wi).dot(axis);
-                    let x = ((ca - cos_outer) / (cos_inner - cos_outer)).clamp(0.0, 1.0);
-                    (wi, dd, rad * (x * x * (3.0 - 2.0 * x)))
-                }
-                RtLight::Area { c, ex, ey, n, area, rad } => {
-                    let pl = c + ex * (2.0 * rng.f() - 1.0) + ey * (2.0 * rng.f() - 1.0);
-                    let dv = pl - po;
-                    let d2 = dv.length_squared().max(1e-8);
-                    let dd = d2.sqrt();
-                    let wi = dv / dd;
-                    let cos_l = n.dot(-wi);
-                    if cos_l <= 0.0 {
-                        continue;
-                    }
-                    // Uniform area sampling: L · cosθ_light · A / d².
-                    (wi, dd * (1.0 - 1e-4), rad * (cos_l * area / d2))
-                }
-            };
+            let Some((wi, dist, rad)) = sc.light_sample(light, po, rng) else { continue };
             if rad.max_element() <= 0.0 || wi.dot(ng) <= 0.0 {
                 continue;
             }
@@ -1010,7 +1466,7 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
             if (fd + fs).max_element() <= 0.0 {
                 continue;
             }
-            let tr = sc.transmission(po, wi, dist, time);
+            let tr = sc.transmission(po, wi, dist, time, rng);
             if tr > 0.0 {
                 let k = thr * rad * tr;
                 let (mut cd, mut cs) = (k * fd, k * fs);
@@ -1043,6 +1499,7 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
             }
             thr *= f / pdf * ao;
             cat = if spec { PathCat::Specular } else { PathCat::Diffuse };
+            last_spec = spec && surf.alpha < 0.1;
             depth += 1;
             if !thr.is_finite() {
                 break;
@@ -1051,7 +1508,8 @@ fn trace(sc: &RtScene, s: &RenderSettings, mut o: Vec3, mut d: Vec3, rng: &mut R
             d = wi;
             continue;
         }
-        let Some(wi) = surf.sample(wo, rng) else { break };
+        let Some((wi, spec)) = surf.sample_lobe(wo, rng) else { break };
+        last_spec = spec && surf.alpha < 0.1;
         let (f, pdf) = surf.eval(wo, wi);
         if pdf <= 1e-8 || wi.dot(ng) <= 0.0 {
             break;
@@ -1086,8 +1544,35 @@ struct Buffers {
     /// Accumulated light-path radiance: diffuse direct, diffuse indirect, specular, emission
     /// (RGB each).
     lobes: Vec<[f32; 12]>,
+    /// Object coverage per pixel: up to four (object id, samples) pairs, most first.
+    ids: Vec<[(u32, f32); ID_SLOTS]>,
     /// Samples accumulated per row.
     row_spp: Vec<u32>,
+}
+
+const ID_SLOTS: usize = 4;
+
+/// Add one sample of object `id` (0 = background, not stored) to a pixel's coverage list.
+fn add_id(slots: &mut [(u32, f32); ID_SLOTS], id: u32) {
+    if id == 0 {
+        return;
+    }
+    if let Some(s) = slots.iter_mut().find(|s| s.0 == id) {
+        s.1 += 1.0;
+    } else if let Some(s) = slots.iter_mut().find(|s| s.0 == 0) {
+        *s = (id, 1.0);
+    } else {
+        // Full: the newcomer replaces the weakest entry only once it would outrank it.
+        return;
+    }
+    slots.sort_by(|a, b| b.1.total_cmp(&a.1));
+}
+
+/// A stable display colour for an ID.
+fn id_color(key: u64) -> Vec3 {
+    let h = (key as u32 ^ (key >> 32) as u32).wrapping_add(1).wrapping_mul(2654435761).rotate_left(7) ^ 0x5bd1e995;
+    let c = |k: u32| (60 + ((h >> k) & 0xff) % 196) as f32 / 255.0;
+    Vec3::new(c(0), c(8), c(16))
 }
 
 struct Shared {
@@ -1115,6 +1600,7 @@ pub enum Pass {
     Normal,
     Depth,
     ObjectId,
+    MaterialId,
     /// Light-path passes: these four add up to the (undenoised) beauty.
     DiffuseDirect,
     DiffuseIndirect,
@@ -1123,12 +1609,13 @@ pub enum Pass {
 }
 
 impl Pass {
-    pub const ALL: [Pass; 9] = [
+    pub const ALL: [Pass; 10] = [
         Pass::Beauty,
         Pass::Albedo,
         Pass::Normal,
         Pass::Depth,
         Pass::ObjectId,
+        Pass::MaterialId,
         Pass::DiffuseDirect,
         Pass::DiffuseIndirect,
         Pass::Specular,
@@ -1152,6 +1639,7 @@ impl Pass {
             Pass::Normal => "normal",
             Pass::Depth => "depth",
             Pass::ObjectId => "objectid",
+            Pass::MaterialId => "materialid",
             Pass::DiffuseDirect => "diffuse_direct",
             Pass::DiffuseIndirect => "diffuse_indirect",
             Pass::Specular => "specular",
@@ -1169,6 +1657,7 @@ impl Pass {
             Pass::Normal => "Normal",
             Pass::Depth => "Depth",
             Pass::ObjectId => "Object ID",
+            Pass::MaterialId => "Material ID",
             Pass::DiffuseDirect => "Diffuse Direct",
             Pass::DiffuseIndirect => "Diffuse Indirect",
             Pass::Specular => "Specular",
@@ -1186,6 +1675,9 @@ pub struct RenderJob {
     pub started: std::time::Instant,
     pub finished: Option<std::time::Duration>,
     pub tri_count: usize,
+    /// Node / material group per object id (see [`RtScene::obj_nodes`]).
+    pub obj_nodes: Vec<crate::scene::NodeId>,
+    pub obj_mats: Vec<u32>,
     handles: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -1213,13 +1705,14 @@ impl RenderJob {
             h,
             region,
             base,
-            buf: Mutex::new(Buffers { accum: vec![[0.0; 4]; (w * h) as usize], aov: vec![[0.0; 10]; (w * h) as usize], lobes: vec![[0.0; 12]; (w * h) as usize], row_spp: vec![0; h as usize] }),
+            buf: Mutex::new(Buffers { accum: vec![[0.0; 4]; (w * h) as usize], aov: vec![[0.0; 10]; (w * h) as usize], lobes: vec![[0.0; 12]; (w * h) as usize], ids: vec![[(0, 0.0); ID_SLOTS]; (w * h) as usize], row_spp: vec![0; h as usize] }),
             cancel: AtomicBool::new(false),
             rows_done: AtomicU64::new(0),
             version: AtomicU64::new(0),
             workers_left: AtomicU64::new(threads as u64),
         });
         let tri_count = scene.tri_count;
+        let (obj_nodes, obj_mats) = (scene.obj_nodes.clone(), scene.obj_mats.clone());
         let mut handles = Vec::new();
         for wi in 0..threads {
             let (sh, sc, st) = (shared.clone(), scene.clone(), settings.clone());
@@ -1229,7 +1722,7 @@ impl RenderJob {
                 sh.version.fetch_add(1, Ordering::SeqCst);
             }));
         }
-        RenderJob { id: JOB_ID.fetch_add(1, Ordering::Relaxed), shared, settings, started: std::time::Instant::now(), finished: None, tri_count, handles }
+        RenderJob { id: JOB_ID.fetch_add(1, Ordering::Relaxed), shared, settings, started: std::time::Instant::now(), finished: None, tri_count, obj_nodes, obj_mats, handles }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -1359,6 +1852,10 @@ impl RenderJob {
         if pass.lobe().is_some() {
             return tonemap(&self.pass_linear(pass), exposure, tm);
         }
+        if matches!(pass, Pass::ObjectId | Pass::MaterialId) {
+            // Antialiased: each object's colour weighted by its pixel coverage.
+            return self.pass_linear(pass).iter().flat_map(|p| [p[0], p[1], p[2], p[3]].map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)).collect();
+        }
         let b = self.shared.buf.lock().unwrap();
         let wu = self.shared.w as usize;
         let enc = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0 + 0.5) as u8;
@@ -1398,16 +1895,6 @@ impl RenderJob {
                         [v, v, v, 255]
                     }
                 }
-                Pass::ObjectId => {
-                    let id = a[9] as u32;
-                    if id == 0 {
-                        [0, 0, 0, 0]
-                    } else {
-                        let h = id.wrapping_mul(2654435761).rotate_left(7) ^ 0x5bd1e995;
-                        let c = |k: u32| 60 + ((h >> k) & 0xff) as u8 % 196;
-                        [c(0), c(8), c(16), 255]
-                    }
-                }
                 _ => unreachable!(),
             };
             out.extend_from_slice(&px);
@@ -1421,6 +1908,27 @@ impl RenderJob {
     pub fn pass_linear(&self, pass: Pass) -> Vec<[f32; 4]> {
         if pass == Pass::Beauty {
             return self.final_linear();
+        }
+        if matches!(pass, Pass::ObjectId | Pass::MaterialId) {
+            let cov = self.id_coverage();
+            let key = |id: u32| -> u64 {
+                let i = id as usize - 1;
+                match pass {
+                    Pass::MaterialId => self.obj_mats.get(i).map(|&m| m as u64 | 1 << 40).unwrap_or(id as u64),
+                    _ => self.obj_nodes.get(i).copied().unwrap_or(id as u64),
+                }
+            };
+            return cov
+                .iter()
+                .map(|slots| {
+                    let (mut c, mut a) = (Vec3::ZERO, 0.0);
+                    for &(id, w) in slots.iter().filter(|s| s.0 != 0) {
+                        c += id_color(key(id)) * w;
+                        a += w;
+                    }
+                    [c.x, c.y, c.z, a.min(1.0)]
+                })
+                .collect();
         }
         let b = self.shared.buf.lock().unwrap();
         let wu = self.shared.w as usize;
@@ -1442,7 +1950,6 @@ impl RenderJob {
                         [v.x, v.y, v.z, if v == Vec3::ZERO { 0.0 } else { 1.0 }]
                     }
                     Pass::Depth => [a[8], a[8], a[8], if a[8] > 0.0 { 1.0 } else { 0.0 }],
-                    Pass::ObjectId => [a[9], a[9], a[9], if a[9] > 0.0 { 1.0 } else { 0.0 }],
                     _ => {
                         let k = pass.lobe().unwrap_or(0);
                         [l[k] / n, l[k + 1] / n, l[k + 2] / n, cov]
@@ -1450,6 +1957,48 @@ impl RenderJob {
                 }
             })
             .collect()
+    }
+
+    /// Per-pixel object coverage (0..1) from all samples: up to four (object id, coverage)
+    /// pairs, most coverage first; id 0 = unused slot.
+    pub fn id_coverage(&self) -> Vec<[(u32, f32); ID_SLOTS]> {
+        let b = self.shared.buf.lock().unwrap();
+        let wu = self.shared.w as usize;
+        b.ids
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let n = b.row_spp[i / wu];
+                if n == 0 || !self.in_region(i) {
+                    return [(0, 0.0); ID_SLOTS];
+                }
+                s.map(|(id, w)| (id, w / n as f32))
+            })
+            .collect()
+    }
+
+    /// Matte (coverage 0..1 per pixel) of the given object ids (1-based object indices).
+    pub fn matte(&self, objs: &std::collections::HashSet<u32>) -> Vec<f32> {
+        self.id_coverage().iter().map(|s| s.iter().filter(|x| objs.contains(&x.0)).map(|x| x.1).sum::<f32>().min(1.0)).collect()
+    }
+
+    /// Save a matte as grey RGB = coverage, opaque (PNG 8-bit, or float EXR).
+    pub fn save_matte(&self, m: &[f32], file: &std::path::Path) -> Result<(), String> {
+        let (w, h) = self.size();
+        if let Some(dir) = file.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if is_exr(file) {
+            let px: Vec<[f32; 4]> = m.iter().map(|&v| [v, v, v, 1.0]).collect();
+            return save_exr(file, w, h, &px);
+        }
+        let img = image::RgbaImage::from_raw(w, h, m.iter().flat_map(|&v| {
+            let g = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            [g, g, g, 255]
+        }).collect()).ok_or("image size")?;
+        img.save(file).map_err(|e| format!("{}: {e}", file.display()))
     }
 
     /// Save every pass next to `path` as name_beauty.png, name_albedo.png, … — or, when
@@ -1664,6 +2213,7 @@ fn worker(sh: &Shared, sc: &RtScene, cam: &RtCamera, s: &RenderSettings, wi: u32
     let mut row = vec![[0.0f32; 4]; w as usize];
     let mut row_aov = vec![[0.0f32; 10]; w as usize];
     let mut row_lobes = vec![[0.0f32; 12]; w as usize];
+    let mut row_ids = vec![0u32; w as usize];
     for pass in 0..s.spp.max(1) {
         let mut y = ry0 + wi;
         while y < ry1.min(h) {
@@ -1691,6 +2241,7 @@ fn worker(sh: &Shared, sc: &RtScene, cam: &RtCamera, s: &RenderSettings, wi: u32
                 };
                 row[x as usize] = [c.x, c.y, c.z, a];
                 let lm = lum(c);
+                row_ids[x as usize] = aov.obj;
                 row_aov[x as usize] = [aov.albedo.x, aov.albedo.y, aov.albedo.z, aov.normal.x, aov.normal.y, aov.normal.z, lm * lm, aov.gloss, aov.depth, aov.obj as f32];
             }
             {
@@ -1714,6 +2265,9 @@ fn worker(sh: &Shared, sc: &RtScene, cam: &RtCamera, s: &RenderSettings, wi: u32
                     for k in 0..12 {
                         dst[k] += src[k];
                     }
+                }
+                for (dst, &id) in b.ids[base..base + w as usize].iter_mut().zip(&row_ids).skip(x0).take(x1 - x0) {
+                    add_id(dst, id);
                 }
                 b.row_spp[y as usize] += 1;
             }

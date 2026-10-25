@@ -81,6 +81,8 @@ FX (simulate as the time slider plays; cached per frame):
            [-dx x -dy y -dz z] [-f freq] [-s speed] [-p x y z] [-n name] [targets]   (field -type air ...)
   connectDynamic -f field target | -rf field target   (no targets = acts on every simulation)
   hairSystem [-count N] [-length L] [-lr 0.2] [-seg 8] [-curl deg] [-tilt deg] [-stiff 0.25] [-width w] [-rgb r g b] [-tip r g b] [-n name] mesh
+  fluidPreset smoke|fire|explosion [source] [-n name]   fluidContainer [-res 48] [-size x y z] [-p x y z] [-n name]
+  fluidEmitter [-dens 4 -heat 5 -r 0.35 -spd 0 -inherit 0.5 -dur 0 -exp 0] source [container]   fluidExport -dir path [-s -e] [container]
   makeCurvesDynamic [-pinTip] curves   (→ <curve>_dyn output curves)   hairToCurves hairSystem
 Recipes:
   lightRig -preset studio|outdoor|sunset|night|product|dramatic [-i 1] [-target objects]   (replaces the lightRig group)
@@ -91,14 +93,15 @@ Director / posing / rig check:
   makeShot -theme forest|city|desert|beach|studio|snow|space [-subject human|robot|alien|none] [-anim walk|...] [-mood sunset|...]
            [-camera static|track|dolly|orbit|crane] [-fx rain|snow|sparks|fireflies|dust|leaves|cape|flag]... [-wind] [-s 1 -e 120] [-clear]
   character -style human|robot|alien [-h 1.8] [-p x y z] [-n name]   environment -theme forest [-size 24] [-density 1] [-seed 7]
-  shotCamera -type static|track|dolly|orbit|crane [-target obj] [-s 1 -e 120] [-n name]   fxPreset rain|snow|sparks|fireflies|dust|leaves|cape|flag [-wind]
+  shotCamera -type static|track|dolly|orbit|crane [-target obj] [-s 1 -e 120] [-n name]   fxPreset rain|snow|sparks|fireflies|dust|leaves|cape|flag|smoke|fire|explosion [-wind]
   pose -part arm|elbow|leg|knee|foot|head|chest|hips [-side L|R|both] -action raise|lower|forward|back|bend|straighten|lift|step|turn|nod|tilt|lean|twist|crouch|stand
        [-dir left|right|forward|back|up|down] [-amount small|large|<deg>|<n>cm] [-key]
   rigReport (alias explainRig)   skinPercent -normalize mesh
 Rendering (CPU path tracer):
   render [-x 960 -y 540] [-spp 64] [-b 4] [-cam camera] [-o file.png]   render -seq -st 1 -e 24 -o C:/out/name
   renderSettings [-x W -y H -spp N -b N -env sky -exp stops -tm srgb|filmic -bg env|black -clamp 4 -dn on|off -mb on|off -shutter 0.5 -cam cam|-av]
-  renderView [-ipr on|off] [-stop] [-save file.png [-passes]]   render ... -o file.png|.exr -passes [list] (beauty albedo normal depth objectid diffuse_direct diffuse_indirect specular emission)
+  renderView [-ipr on|off] [-stop] [-save file.png [-passes]]   render ... -o file.png|.exr -passes [list] (beauty albedo normal depth objectid materialid diffuse_direct diffuse_indirect specular emission)
+  render ... -o file.png -mattes all|materials|name1,name2   (antialiased ID mattes: file_matte_<name>.png)   render -seq ... -resume
   batch (no window): rust_maya --render scene.rma [-s 1 -e 120] [-cam c] [-o out.png] [-passes] [-mb on]   (rust_maya --help)
   renderSettings -region x0 y0 x1 y1 (0..1, top-left) | -region off
 Look dev:
@@ -388,7 +391,7 @@ fn parse_component(app: &App, spec: &str) -> Option<Result<CompSpec, String>> {
 
 fn run(app: &mut App, stmt: &str) -> Result<String, String> {
     let mut tokens = tokenize(stmt);
-    if let Some(r) = crate::curve_ops::mel(app, &tokens).or_else(|| crate::quad_draw::mel(app, &tokens)).or_else(|| crate::fx::mel(app, &tokens)).or_else(|| crate::director::mel(app, &tokens)).or_else(|| crate::rig_report::mel(app, &tokens)).or_else(|| crate::posing::mel(app, &tokens)).or_else(|| crate::reduce::mel(app, &tokens)) {
+    if let Some(r) = crate::curve_ops::mel(app, &tokens).or_else(|| crate::quad_draw::mel(app, &tokens)).or_else(|| crate::fx::mel(app, &tokens)).or_else(|| crate::fluid::mel(app, &tokens)).or_else(|| crate::director::mel(app, &tokens)).or_else(|| crate::rig_report::mel(app, &tokens)).or_else(|| crate::posing::mel(app, &tokens)).or_else(|| crate::reduce::mel(app, &tokens)) {
         return r;
     }
     let pos_flag = take_vec3(&mut tokens, &["p", "position"]);
@@ -1475,6 +1478,11 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                     return Ok(String::new());
                 }
                 if let Some(p) = val("-save").map(quote) {
+                    if let Some(spec) = val("-mattes") {
+                        let job = app.render.job.as_ref().ok_or("Nothing rendered yet.")?;
+                        let ext = std::path::Path::new(&p).extension().and_then(|e| e.to_str()).unwrap_or("png").to_string();
+                        return Ok(app.save_mattes(job, &spec, crate::render_view::base_without_ext(&p), None, &ext)?.join(" "));
+                    }
                     if flag("-passes") {
                         return Ok(app.save_render_passes(&p)?.join(" "));
                     }
@@ -1492,8 +1500,10 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
                 let st = num("-st").or(num("-start")).unwrap_or(app.scene.play_start) as i32;
                 let en = num("-e").or(num("-end")).unwrap_or(app.scene.play_end) as i32;
                 let out = val("-o").map(quote).ok_or("render -seq needs -o C:/path/name")?;
-                if cfg!(test) || flag("-passes") {
-                    let n = app.render_frames(cam.as_deref(), s, st, en, &out, flag("-passes"), &mut |_, _, _| {})?;
+                if cfg!(test) || flag("-passes") || flag("-mattes") || flag("-resume") {
+                    let fo = crate::render_view::FrameOutput { passes: flag("-passes"), mattes: val("-mattes"), skip_existing: flag("-resume") };
+                    let frames: Vec<i32> = (st..=en).collect();
+                    let n = app.render_frames(cam.as_deref(), s, &frames, &out, &fo, &mut |_, _, _| {})?;
                     return Ok(format!("{n} frames"));
                 }
                 app.render.settings = s;
@@ -1502,18 +1512,25 @@ fn run(app: &mut App, stmt: &str) -> Result<String, String> {
             }
             if let Some(out) = val("-o").map(quote) {
                 let job = app.render_now(cam.as_deref(), s.clone())?;
+                let mut mattes = Vec::new();
+                if let Some(spec) = val("-mattes") {
+                    let ext = std::path::Path::new(&out).extension().and_then(|e| e.to_str()).unwrap_or("png").to_string();
+                    mattes = app.save_mattes(&job, &spec, crate::render_view::base_without_ext(&out), None, &ext)?;
+                }
                 if flag("-passes") {
                     // `-passes` = all; `-passes specular,emission` = just those.
                     let list = match val("-passes").filter(|v| !v.starts_with('-')) {
                         Some(v) => v.split(',').filter(|x| !x.is_empty()).map(|x| crate::raytrace::Pass::from_name(x).ok_or_else(|| format!("Unknown pass '{x}'"))).collect::<Result<Vec<_>, _>>()?,
                         None => crate::raytrace::Pass::ALL.to_vec(),
                     };
-                    let files = job.save_pass_list(std::path::Path::new(&out), &list, s.exposure, s.tonemap)?;
+                    let mut files = job.save_pass_list(std::path::Path::new(&out), &list, s.exposure, s.tonemap)?;
+                    files.extend(mattes);
                     return Ok(files.join(" "));
                 }
                 job.save_png(std::path::Path::new(&out), s.exposure, s.tonemap)?;
                 let mut job = job;
-                return Ok(format!("{}x{} {} spp in {:.2}s → {out}", s.width, s.height, s.spp, job.elapsed().as_secs_f32()));
+                let extra = if mattes.is_empty() { String::new() } else { format!(" + {} mattes", mattes.len()) };
+                return Ok(format!("{}x{} {} spp in {:.2}s → {out}{extra}", s.width, s.height, s.spp, job.elapsed().as_secs_f32()));
             }
             app.render.settings = s;
             if let Some(c) = &cam {

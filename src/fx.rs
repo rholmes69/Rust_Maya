@@ -253,6 +253,31 @@ pub struct SimCache<F> {
     /// Frame index shown now (into `frames`), and a version for the viewport cache.
     pub current: Option<usize>,
     pub version: u64,
+    /// Sub-frame state shown instead of `frames[current]` when the scene time falls between
+    /// frames (motion blur): cloth and hair blend to the next frame, particles move along
+    /// their velocity. `shift` is the sub-frame offset it was made for.
+    pub blend: Option<Arc<F>>,
+    pub shift: f32,
+}
+
+/// Frame index and sub-frame offset for `time` in a cache starting at `start`:
+/// (floor frame, fraction 0..1). Times within 1e-4 of a frame count as that frame.
+pub fn sub_frame(time: f32, start: f32) -> (usize, f32) {
+    let ft = (time - start).max(0.0);
+    let r = ft.round();
+    if (ft - r).abs() < 1e-4 {
+        return ((r as usize).min(MAX_FRAMES), 0.0);
+    }
+    let f = ft.floor();
+    ((f as usize).min(MAX_FRAMES), ft - f)
+}
+
+/// Linear blend of two equal-length point lists (falls back to `a`).
+pub fn lerp_points(a: &[Vec3], b: &[Vec3], t: f32) -> Vec<Vec3> {
+    if a.len() != b.len() {
+        return a.to_vec();
+    }
+    a.iter().zip(b).map(|(p, q)| p.lerp(*q, t)).collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -271,6 +296,9 @@ impl<F> std::fmt::Debug for SimCache<F> {
 impl Particles {
     /// Particles at the current time.
     pub fn current(&self) -> &[Particle] {
+        if let Some(b) = &self.cache.blend {
+            return &b.particles;
+        }
         self.cache.current.and_then(|i| self.cache.frames.get(i)).map(|f| f.particles.as_slice()).unwrap_or(&[])
     }
 }
@@ -347,6 +375,9 @@ pub struct Cloth {
 impl Cloth {
     /// Simulated world positions at the current time.
     pub fn current(&self) -> Option<&[Vec3]> {
+        if let Some(b) = &self.cache.blend {
+            return Some(&b.pos);
+        }
         self.cache.current.and_then(|i| self.cache.frames.get(i)).map(|f| f.pos.as_slice())
     }
 }
@@ -572,7 +603,7 @@ impl Tracks {
         for n in &mut sc.nodes {
             n.surf = None;
             n.cloth = None;
-            if matches!(n.shape, Shape::Particles(_) | Shape::Hair(_)) {
+            if matches!(n.shape, Shape::Particles(_) | Shape::Hair(_) | Shape::Fluid(_)) {
                 n.shape = Shape::Locator;
             }
             if !keep_meshes.contains(&n.id) {
@@ -1336,11 +1367,16 @@ pub fn update(scene: &mut Scene) {
             let key = particle_key(scene, id, &ps.settings);
             let mut cache = (*ps.cache).clone();
             if cache.key != key || cache.frames.is_empty() {
-                cache = SimCache { key, frames: vec![Arc::new(ParticleFrame::default())], current: None, version: cache.version.wrapping_add(1) };
+                cache = SimCache { key, frames: vec![Arc::new(ParticleFrame::default())], current: None, version: cache.version.wrapping_add(1), blend: None, shift: 0.0 };
             }
             let s = ps.settings.clone();
             // frames[k] = state k frames after the start frame (frames[0] = nothing emitted).
-            let target = ((time - s.start).round().max(0.0) as usize).min(MAX_FRAMES);
+            // Between frames, the particles of the anchor frame (the nearest frame, or the
+            // frame a motion-blurred render is centred on) move along their velocity, so both
+            // shutter ends see the same particles.
+            let anchor = scene.sim_anchor.unwrap_or(time.round());
+            let target = ((anchor - s.start).round().max(0.0) as usize).min(MAX_FRAMES);
+            let shift = if time < s.start { 0.0 } else { time - (s.start + target as f32) };
             let have = cache.frames.len() - 1;
             if target > have {
                 let mut keep = vec![id];
@@ -1356,8 +1392,15 @@ pub fn update(scene: &mut Scene) {
                 }
             }
             let cur = if time < s.start { 0 } else { target.min(cache.frames.len() - 1) };
-            if cache.current != Some(cur) {
+            let shift = if cur == target { shift } else { 0.0 };
+            if cache.current != Some(cur) || cache.shift != shift {
                 cache.current = Some(cur);
+                cache.shift = shift;
+                cache.blend = (shift.abs() > 1e-4).then(|| {
+                    let f = &cache.frames[cur];
+                    let dt = shift / fps.max(1.0);
+                    Arc::new(ParticleFrame { particles: f.particles.iter().map(|q| Particle { p: q.p + q.v * dt, age: q.age + dt, ..*q }).collect(), carry: f.carry, next_id: f.next_id })
+                });
                 cache.version = cache.version.wrapping_add(1);
             }
             if let Some(Shape::Particles(p)) = scene.node_mut(id).map(|n| &mut n.shape) {
@@ -1369,7 +1412,9 @@ pub fn update(scene: &mut Scene) {
             let key = cloth_key(scene, id, &cl.settings);
             let s = cl.settings.clone();
             let mut cache = (*cl.cache).clone();
-            let target = ((time - s.start).round().max(0.0) as usize).min(MAX_FRAMES);
+            let (base, frac) = sub_frame(time, s.start);
+            // Between frames, simulate one frame further and blend.
+            let target = if frac > 0.0 { (base + 1).min(MAX_FRAMES) } else { base };
             let stale = cache.key != key || cache.frames.is_empty();
             if stale || target + 1 > cache.frames.len() {
                 let mut keep = vec![id];
@@ -1379,7 +1424,7 @@ pub fn update(scene: &mut Scene) {
                 let Some((start_pos, faces)) = tr.mesh_world(id) else { continue };
                 let setup = cloth_setup(&tr, id, &s, &start_pos, &faces);
                 if stale {
-                    cache = SimCache { key, frames: vec![Arc::new(ClothFrame { pos: start_pos.clone(), prev: start_pos.clone() })], current: None, version: cache.version.wrapping_add(1) };
+                    cache = SimCache { key, frames: vec![Arc::new(ClothFrame { pos: start_pos.clone(), prev: start_pos.clone() })], current: None, version: cache.version.wrapping_add(1), blend: None, shift: 0.0 };
                 }
                 for k in cache.frames.len()..=target {
                     tr.goto(s.start + k as f32);
@@ -1389,9 +1434,15 @@ pub fn update(scene: &mut Scene) {
                     cache.frames.push(Arc::new(next));
                 }
             }
-            let cur = target.min(cache.frames.len() - 1);
-            if cache.current != Some(cur) {
+            let cur = base.min(cache.frames.len() - 1);
+            let frac = if cur + 1 < cache.frames.len() { frac } else { 0.0 };
+            if cache.current != Some(cur) || cache.shift != frac {
                 cache.current = Some(cur);
+                cache.shift = frac;
+                cache.blend = (frac > 0.0).then(|| {
+                    let pos = lerp_points(&cache.frames[cur].pos, &cache.frames[cur + 1].pos, frac);
+                    Arc::new(ClothFrame { prev: pos.clone(), pos })
+                });
                 cache.version = cache.version.wrapping_add(1);
             }
             if let Some(c) = scene.node_mut(id).and_then(|n| n.cloth.as_mut()) {
@@ -1526,9 +1577,9 @@ impl App {
 
     /// Restrict a field to a simulation (or remove it from the field's targets).
     pub fn connect_field(&mut self, field: NodeId, target: NodeId, remove: bool) -> Result<(), String> {
-        let ok = self.scene.node(target).is_some_and(|n| matches!(n.shape, Shape::Particles(_) | Shape::Hair(_)) || n.cloth.is_some());
+        let ok = self.scene.node(target).is_some_and(|n| matches!(n.shape, Shape::Particles(_) | Shape::Hair(_) | Shape::Fluid(_)) || n.cloth.is_some());
         if !ok {
-            return Err("connectDynamic -f: the target must be a particle system, an nCloth mesh or a hair system.".into());
+            return Err("connectDynamic -f: the target must be a particle system, an nCloth mesh, a hair system or a fluid container.".into());
         }
         if !matches!(self.scene.node(field).map(|n| &n.shape), Some(Shape::Field(_))) {
             return Err("connectDynamic -f: not a field.".into());
@@ -1545,7 +1596,7 @@ impl App {
 
     /// Dynamics objects (particles, cloth, hair) among the selection.
     pub fn selected_dynamics(&self) -> Vec<NodeId> {
-        self.sel.iter().copied().filter(|i| self.scene.node(*i).is_some_and(|n| matches!(n.shape, Shape::Particles(_) | Shape::Hair(_)) || n.cloth.is_some())).collect()
+        self.sel.iter().copied().filter(|i| self.scene.node(*i).is_some_and(|n| matches!(n.shape, Shape::Particles(_) | Shape::Hair(_) | Shape::Fluid(_)) || n.cloth.is_some())).collect()
     }
 
     /// Add (or remove) a passive collider for particles / cloth.
@@ -1561,8 +1612,9 @@ impl App {
         let list = match (&mut n.shape, &mut n.cloth) {
             (Shape::Particles(p), _) => &mut p.settings.colliders,
             (Shape::Hair(h), _) => &mut h.settings.colliders,
+            (Shape::Fluid(f), _) => &mut f.settings.colliders,
             (_, Some(c)) => &mut c.settings.colliders,
-            _ => return Err("connectDynamic: the target must be a particle system, an nCloth mesh or a hair system.".into()),
+            _ => return Err("connectDynamic: the target must be a particle system, an nCloth mesh, a hair system or a fluid container.".into()),
         };
         list.retain(|c| *c != collider);
         if !remove {
@@ -1581,7 +1633,7 @@ pub fn set_attr(app: &mut App, spec: &str, vals: &[f32]) -> Option<Result<(), St
     }
     let id = app.scene.find_by_name(node)?;
     let n = app.scene.node(id)?;
-    if !matches!(n.shape, Shape::Particles(_) | Shape::Field(_) | Shape::Hair(_)) && n.cloth.is_none() {
+    if !matches!(n.shape, Shape::Particles(_) | Shape::Field(_) | Shape::Hair(_) | Shape::Fluid(_)) && n.cloth.is_none() {
         return None;
     }
     // Validate on a copy first so a bad attribute doesn't create an undo step.
@@ -1589,6 +1641,7 @@ pub fn set_attr(app: &mut App, spec: &str, vals: &[f32]) -> Option<Result<(), St
         (Shape::Particles(p), _) => p.settings.clone().set_attr(attr, vals),
         (Shape::Field(f), _) => f.clone().set_attr(attr, vals),
         (Shape::Hair(h), _) => h.settings.clone().set_attr(attr, vals),
+        (Shape::Fluid(f), _) => f.settings.clone().set_attr(attr, vals),
         (_, Some(c)) => c.settings.clone().set_attr(attr, vals),
         _ => return None,
     };
@@ -1601,6 +1654,7 @@ pub fn set_attr(app: &mut App, spec: &str, vals: &[f32]) -> Option<Result<(), St
         (Shape::Particles(p), _) => p.settings.set_attr(attr, vals),
         (Shape::Field(f), _) => f.set_attr(attr, vals),
         (Shape::Hair(h), _) => h.settings.set_attr(attr, vals),
+        (Shape::Fluid(f), _) => f.settings.set_attr(attr, vals),
         (_, Some(c)) => c.settings.set_attr(attr, vals),
         _ => Ok(()),
     })
@@ -1626,6 +1680,7 @@ pub fn get_attr(app: &App, spec: &str) -> Option<String> {
             _ => return None,
         }),
         Shape::Hair(h) => crate::hair::get_attr(h, attr),
+        Shape::Fluid(f) => crate::fluid::get_attr(f, attr),
         _ => n.cloth.as_ref().and_then(|c| match attr {
             "stretch" => Some(c.settings.stretch.to_string()),
             "bend" => Some(c.settings.bend.to_string()),
@@ -2206,5 +2261,70 @@ mod tests {
         let t = std::time::Instant::now();
         let g = app.build_geometry();
         eprintln!("geometry build {:.1} ms, {} tri chunks", t.elapsed().as_secs_f32() * 1000.0, g.tris.len());
+    }
+
+    #[test]
+    fn sub_frame_sampling_blends_sims() {
+        let mut app = App::new();
+        app.scene.nodes.clear();
+        app.scene.fps = 24.0;
+        // Cloth: half-way between frames = the average of the two frames.
+        execute(&mut app, "polyPlane -w 2 -h 2 -sx 6 -sy 6 -n flag; rotate 90 0 0 flag; move 0 3 0 flag; nCloth flag").unwrap();
+        let flag = app.scene.find_by_name("flag").unwrap();
+        at(&mut app, 8.0);
+        let a = wpts(&app, flag);
+        at(&mut app, 9.0);
+        let b = wpts(&app, flag);
+        at(&mut app, 8.25);
+        let m = wpts(&app, flag);
+        let moved = a.iter().zip(&b).map(|(p, q)| p.distance(*q)).fold(0.0f32, f32::max);
+        assert!(moved > 1e-3, "cloth moves between frames");
+        for ((p, q), r) in a.iter().zip(&b).zip(&m) {
+            assert!(p.lerp(*q, 0.25).distance(*r) < 1e-5);
+        }
+        // Integer times are unchanged.
+        at(&mut app, 9.0);
+        assert_eq!(wpts(&app, flag), b);
+
+        // Particles: the nearest frame's particles, moved along their velocity.
+        execute(&mut app, "emitter -type omni -r 96 -spd 3 -lifespan 0 -n spray; move 0 2 0 spray").unwrap();
+        at(&mut app, 10.0);
+        let p10 = parts(&app, "spray");
+        assert!(p10.len() > 10);
+        for t in [10.3f32, 9.7] {
+            at(&mut app, t);
+            let pt = parts(&app, "spray");
+            assert_eq!(pt.len(), p10.len(), "same particles at {t}");
+            for (q, r) in p10.iter().zip(&pt) {
+                assert_eq!(q.id, r.id);
+                assert!((q.p + q.v * ((t - 10.0) / 24.0)).distance(r.p) < 1e-5);
+            }
+        }
+        // A motion-blur anchor keeps the anchor frame's particles even past the half-way point.
+        app.scene.sim_anchor = Some(10.0);
+        at(&mut app, 10.5);
+        assert_eq!(parts(&app, "spray").len(), p10.len());
+        app.scene.sim_anchor = None;
+    }
+
+    #[test]
+    fn particles_blur_in_motion_blurred_renders() {
+        let mut app = App::new();
+        app.scene.nodes.clear();
+        app.scene.fps = 24.0;
+        execute(&mut app, "emitter -type directional -r 100 -spd 30 -lifespan 0 -n jet; move -6 3 0 jet; setAttr jet.gravity 0; setAttr jet.radius 0.12; camera -n cam1 -p 0 3 12 -aim 0 3 0").unwrap();
+        app.set_time(6.0);
+        let s = crate::raytrace::RenderSettings { width: 96, height: 64, spp: 16, bounces: 1, denoise: false, ..Default::default() };
+        let cov = |j: &crate::raytrace::RenderJob| {
+            let lin = j.linear();
+            (lin.iter().filter(|p| p[3] > 0.02 && p[3] < 0.98).count(), lin.iter().filter(|p| p[3] > 0.02).count())
+        };
+        let (p0, a0) = cov(&app.render_now(Some("cam1"), s.clone()).unwrap());
+        let (p1, a1) = cov(&app.render_now(Some("cam1"), crate::raytrace::RenderSettings { motion_blur: true, shutter: 1.0, ..s }).unwrap());
+        eprintln!("particles: partial {p0}/{a0} sharp, {p1}/{a1} blurred");
+        assert!(a0 > 20, "particles visible");
+        assert!(a1 > a0 * 3 / 2, "particles streak");
+        assert_eq!(app.scene.sim_anchor, None);
+        assert_eq!(app.scene.time, 6.0);
     }
 }

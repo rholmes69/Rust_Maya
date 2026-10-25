@@ -219,6 +219,8 @@ struct Writer<'a> {
     color_mats: HashMap<String, String>,
     notes: Vec<String>,
     counts: [usize; 5], // meshes, lights, cameras, curves, animated
+    /// Where fluid VDB files go: (folder, path prefix relative to the .usda).
+    vdb_dir: Option<(std::path::PathBuf, String)>,
 }
 
 impl Writer<'_> {
@@ -328,6 +330,55 @@ impl Writer<'_> {
                 self.line(d + 1, &format!("float[] widths = [{}] (interpolation = \"constant\")", f(ps.settings.radius * 2.0)));
                 self.line(d + 1, &format!("color3f[] primvars:displayColor = [{}]", lin(ps.settings.color)));
                 self.line(d, "}");
+            }
+            Shape::Fluid(fl) => {
+                // A Volume whose fields are OpenVDB files written next to the .usda (one per frame).
+                let frames: Vec<(Option<f32>, Vec<u8>)> = match self.baked.fluids.get(&id).filter(|v| v.iter().any(|b| !b.is_empty())) {
+                    Some(v) => v.iter().enumerate().map(|(i, b)| (Some(self.baked.frames[i]), b.clone())).collect(),
+                    None => vec![(None, crate::fluid::vdb_for(sc, id, false).unwrap_or_default())],
+                };
+                if let Some((dir, rel)) = self.vdb_dir.clone() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let mut files: Vec<(Option<f32>, String)> = Vec::new();
+                    for (fr, bytes) in &frames {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        let file = match fr {
+                            Some(f) => format!("{name}.{:04}.vdb", *f as i32),
+                            None => format!("{name}.vdb"),
+                        };
+                        if std::fs::write(dir.join(&file), bytes).is_ok() {
+                            files.push((*fr, format!("{rel}/{file}")));
+                        }
+                    }
+                    if !files.is_empty() {
+                        let st = &fl.settings;
+                        self.line(d, &format!("def Volume \"{shape_name}\""));
+                        self.line(d, "{");
+                        self.line(d + 1, "rel field:density = <density>");
+                        self.line(d + 1, "rel field:temperature = <temperature>");
+                        self.line(d + 1, &format!("color3f[] primvars:displayColor = [{}]", lin(st.smoke_color)));
+                        for field in ["density", "temperature"] {
+                            self.line(d + 1, &format!("def OpenVDBAsset \"{field}\""));
+                            self.line(d + 1, "{");
+                            if files.len() == 1 && files[0].0.is_none() {
+                                self.line(d + 2, &format!("asset filePath = @{}@", files[0].1));
+                            } else {
+                                let s: Vec<String> = files.iter().map(|(fr, p)| format!("{}: @{p}@", f(fr.unwrap_or(0.0)))).collect();
+                                self.line(d + 2, &format!("asset filePath.timeSamples = {{ {} }}", s.join(", ")));
+                            }
+                            self.line(d + 2, &format!("token fieldName = \"{field}\""));
+                            let class = if field == "density" { "fogVolume" } else { "unknown" };
+                            self.line(d + 2, &format!("token fieldClass = \"{class}\""));
+                            self.line(d + 1, "}");
+                        }
+                        self.line(d, "}");
+                        self.notes.push(format!("{}: {} VDB file(s) in {rel}", n.name, files.len()));
+                    }
+                } else {
+                    self.notes.push(format!("{}: smoke needs a file export (VDB files are written next to the .usda)", n.name));
+                }
             }
             Shape::Hair(h) => {
                 // Linear BasisCurves (one curve per strand), tapered widths, root→tip colours.
@@ -794,7 +845,11 @@ pub fn export(app: &App, opts: &ExportOptions) -> Result<(Vec<u8>, String), Stri
             }
         }
     }
-    let mut w = Writer { app, set: &set, baked: &baked, out: String::new(), mat_paths: HashMap::new(), color_mats: HashMap::new(), notes: Vec::new(), counts: [0; 5] };
+    let vdb_dir = opts.out_path.as_ref().map(|p| {
+        let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "scene".into());
+        (p.with_file_name(format!("{stem}_vdb")), format!("./{stem}_vdb"))
+    });
+    let mut w = Writer { app, set: &set, baked: &baked, out: String::new(), mat_paths: HashMap::new(), color_mats: HashMap::new(), notes: Vec::new(), counts: [0; 5], vdb_dir };
     // Material names (unique prim names under /World/Looks).
     let mut look_used: HashSet<String> = HashSet::new();
     let mats: Vec<(u32, String)> = sc.materials.iter().map(|m| (m.id, prim_name(&m.name, &mut look_used))).collect();

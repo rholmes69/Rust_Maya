@@ -155,6 +155,9 @@ pub struct Hair {
 
 impl Hair {
     pub fn current(&self) -> Option<&[Vec3]> {
+        if let Some(b) = &self.cache.blend {
+            return Some(&b.pos);
+        }
         self.cache.current.and_then(|i| self.cache.frames.get(i)).map(|f| f.pos.as_slice())
     }
     pub fn points_per_strand(&self) -> usize {
@@ -463,7 +466,9 @@ pub fn update(scene: &mut Scene) -> bool {
         let s = hair.settings.clone();
         let key = hair_key(scene, id, &s);
         let mut cache = (*hair.cache).clone();
-        let target = ((time - s.start).round().max(0.0) as usize).min(MAX_FRAMES);
+        let (base, frac) = crate::fx::sub_frame(time, s.start);
+        // Between frames, simulate one frame further and blend.
+        let target = if frac > 0.0 { (base + 1).min(MAX_FRAMES) } else { base };
         let stale = cache.key != key || cache.frames.is_empty();
         if stale || target + 1 > cache.frames.len() {
             let mut keep = vec![id];
@@ -472,7 +477,7 @@ pub fn update(scene: &mut Scene) -> bool {
             tr.goto(s.start);
             let Some(setup) = build_setup(&tr, &s) else {
                 // Nothing to grow from: an empty cache.
-                cache = SimCache { key, frames: vec![Arc::new(HairFrame::default())], current: Some(0), version: cache.version.wrapping_add(1) };
+                cache = SimCache { key, frames: vec![Arc::new(HairFrame::default())], current: Some(0), version: cache.version.wrapping_add(1), blend: None, shift: 0.0 };
                 if let Some(Shape::Hair(h)) = scene.node_mut(id).map(|n| &mut n.shape) {
                     h.cache = Arc::new(cache);
                 }
@@ -482,7 +487,7 @@ pub fn update(scene: &mut Scene) -> bool {
             let per = s.segments.max(1) as usize + 1;
             let seg = seg_lengths(&setup, g0.len() / per);
             if stale {
-                cache = SimCache { key, frames: vec![Arc::new(HairFrame { pos: g0.clone(), prev: g0.clone(), goal: g0 })], current: None, version: cache.version.wrapping_add(1) };
+                cache = SimCache { key, frames: vec![Arc::new(HairFrame { pos: g0.clone(), prev: g0.clone(), goal: g0 })], current: None, version: cache.version.wrapping_add(1), blend: None, shift: 0.0 };
             }
             let mut colliders = s.colliders.clone();
             if s.collide_source && s.source.is_some_and(|src| scene.node(src).is_some_and(|n| n.mesh().is_some())) {
@@ -497,12 +502,18 @@ pub fn update(scene: &mut Scene) -> bool {
                 cache.frames.push(Arc::new(next));
             }
         }
-        let cur = target.min(cache.frames.len() - 1);
-        if cache.current != Some(cur) {
+        let cur = base.min(cache.frames.len() - 1);
+        let frac = if cur + 1 < cache.frames.len() { frac } else { 0.0 };
+        if cache.current != Some(cur) || cache.shift != frac {
             cache.current = Some(cur);
+            cache.shift = frac;
+            cache.blend = (frac > 0.0).then(|| {
+                let (a, b) = (&cache.frames[cur], &cache.frames[cur + 1]);
+                Arc::new(HairFrame { pos: crate::fx::lerp_points(&a.pos, &b.pos, frac), prev: a.prev.clone(), goal: crate::fx::lerp_points(&a.goal, &b.goal, frac) })
+            });
             cache.version = cache.version.wrapping_add(1);
         }
-        let out_pts = cache.frames.get(cur).map(|f| f.pos.clone());
+        let out_pts = cache.blend.as_ref().or(cache.frames.get(cur)).map(|f| f.pos.clone());
         if let Some(Shape::Hair(h)) = scene.node_mut(id).map(|n| &mut n.shape) {
             h.cache = Arc::new(cache);
         }

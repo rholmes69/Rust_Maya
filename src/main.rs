@@ -12,6 +12,7 @@ mod deform;
 mod director;
 mod export;
 mod fbx;
+mod fluid;
 mod fx;
 mod hair;
 mod importer;

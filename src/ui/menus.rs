@@ -25,7 +25,7 @@ fn make_collide(app: &mut App, remove: bool) {
     let sel = app.sel.clone();
     let r = match sel.split_last() {
         Some((target, cols)) if !cols.is_empty() => cols.iter().try_for_each(|c| app.connect_collider(*c, *target, remove)).map(|_| if remove { "Colliders removed".to_string() } else { format!("{} collider(s) connected", cols.len()) }),
-        _ => Err("Select the collider meshes, then the particle system or nCloth mesh last.".into()),
+        _ => Err("Select the collider meshes, then the particle system, nCloth mesh, hair or fluid container last.".into()),
     };
     super::report(app, r);
 }
@@ -67,6 +67,62 @@ fn fields_menu(app: &mut App, ui: &mut egui::Ui) {
         super::report(app, r);
     }
     ui.label(egui::RichText::new("A field with no targets acts on every particle system, cloth and hair. Move / rotate it to place and aim it.").weak().small());
+}
+
+/// A smoke / fire / explosion setup using the selected object as the source.
+fn fluid_preset(app: &mut App, kind: &str) {
+    let src = app.lead();
+    let r = app.fluid_preset(kind, src, None).map(|id| {
+        let name = app.scene.node(id).map(|n| n.name.clone()).unwrap_or_default();
+        format!("Created {name} — play the timeline; render in the Render View")
+    });
+    super::report(app, r);
+}
+
+fn fluids_menu(app: &mut App, ui: &mut egui::Ui) {
+    if item(ui, "3D Container", "empty smoke container") {
+        let at = app.world_bounds(&app.sel.clone()).map(|(a, b)| (a + b) * 0.5);
+        let id = app.create_fluid(crate::fluid::FluidSettings::default(), at, None);
+        let name = app.scene.node(id).map(|n| n.name.clone()).unwrap_or_default();
+        super::report(app, Ok(format!("Created {name}: add emitters with Fluids › Add Emitter")));
+    }
+    if item(ui, "Add Emitter", "selected objects (and container)") {
+        let sel = app.sel.clone();
+        let is_fluid = |app: &App, i: crate::scene::NodeId| matches!(app.scene.node(i).map(|n| &n.shape), Some(crate::scene::Shape::Fluid(_)));
+        let fluid = sel.iter().copied().find(|&i| is_fluid(app, i)).or_else(|| {
+            let all = app.target_fluids();
+            (all.len() == 1).then(|| all[0])
+        });
+        let srcs: Vec<_> = sel.iter().copied().filter(|&i| !is_fluid(app, i)).collect();
+        let r = match fluid {
+            None => Err("Create a container first (or select it with the sources).".to_string()),
+            Some(_) if srcs.is_empty() => Err("Select the source objects (meshes, particles or locators).".to_string()),
+            Some(f) => srcs.iter().try_for_each(|s| app.add_fluid_source(f, crate::fluid::FluidSource { node: *s, ..Default::default() })).map(|_| format!("{} emitter(s) added", srcs.len())),
+        };
+        super::report(app, r);
+    }
+    ui.separator();
+    if item(ui, "Smoke", "from the selected object, or a new source") {
+        fluid_preset(app, "smoke");
+    }
+    if item(ui, "Fire", "") {
+        fluid_preset(app, "fire");
+    }
+    if item(ui, "Explosion", "") {
+        fluid_preset(app, "explosion");
+    }
+    ui.separator();
+    if item(ui, "Make Collide", "colliders, then container") {
+        make_collide(app, false);
+    }
+    if item(ui, "Export VDB Sequence…", "playback range")
+        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+    {
+        let ids = app.target_fluids();
+        let (st, en) = (app.scene.play_start as i32, app.scene.play_end as i32);
+        let r = app.export_vdb_sequence(&ids, &dir, st, en).map(|f| format!("{} VDB files → {}", f.len(), dir.display()));
+        super::report(app, r);
+    }
 }
 
 fn hair_menu(app: &mut App, ui: &mut egui::Ui) {
@@ -502,7 +558,8 @@ pub fn menu_bar(app: &mut App, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
                 ui.menu_button("nCloth", |ui| cloth_menu(app, ui));
                 ui.menu_button("nHair", |ui| hair_menu(app, ui));
                 ui.menu_button("Fields/Solvers", |ui| fields_menu(app, ui));
-                for m in ["Fluids", "Effects", "Bifrost Fluids"] {
+                ui.menu_button("Fluids", |ui| fluids_menu(app, ui));
+                for m in ["Effects", "Bifrost Fluids"] {
                     ui.menu_button(m, |ui| planned(ui, "Not available in this build"));
                 }
             }
@@ -1416,7 +1473,15 @@ pub fn shelf(app: &mut App, ui: &mut egui::Ui) {
                     let r = sel.iter().try_for_each(|c| app.make_curve_dynamic(*c, false, None).map(|_| ())).map(|_| String::new());
                     super::report(app, r);
                 }
-                shelf_button(ui, "Fluid", Color32::from_rgb(150, 150, 150), "Fluid", false);
+                if shelf_button(ui, "Smoke", acc, "Smoke from the selected object (or a new source)", true) {
+                    fluid_preset(app, "smoke");
+                }
+                if shelf_button(ui, "Fire", acc, "Fire from the selected object (or a new source)", true) {
+                    fluid_preset(app, "fire");
+                }
+                if shelf_button(ui, "Boom", acc, "Explosion from the selected object (or a new source)", true) {
+                    fluid_preset(app, "explosion");
+                }
             }
             _ => {
                 let names: &[&str] = &["Network", "Distrib", "Repro"];

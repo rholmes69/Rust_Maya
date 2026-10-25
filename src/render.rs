@@ -54,13 +54,20 @@ pub struct Chunk {
     pub data: Vec<GpuVertex>,
     /// World-space bounds of the block (min, max).
     pub bounds: Option<(glam::Vec3, glam::Vec3)>,
+    /// Viewport-only geometry (e.g. a smoke preview): the path tracer skips it.
+    pub preview: bool,
 }
 
 static CHUNK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Chunk {
     pub fn with_bounds(data: Vec<GpuVertex>, bounds: Option<(glam::Vec3, glam::Vec3)>) -> Arc<Chunk> {
-        Arc::new(Chunk { id: CHUNK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), data, bounds })
+        Arc::new(Chunk { id: CHUNK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), data, bounds, preview: false })
+    }
+
+    /// Viewport-only geometry (not rendered by the path tracer).
+    pub fn preview(data: Vec<GpuVertex>, bounds: Option<(glam::Vec3, glam::Vec3)>) -> Arc<Chunk> {
+        Arc::new(Chunk { id: CHUNK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), data, bounds, preview: true })
     }
 }
 
@@ -77,6 +84,11 @@ pub struct FrameGeometry {
     pub overlay: Vec<GpuVertex>,
     /// Triangles of transparent materials (drawn blended after the opaque ones).
     pub tris_transp: Vec<Arc<Chunk>>,
+    /// The node each chunk of `tris` / `tris_transp` came from (ID passes and mattes).
+    pub tri_nodes: Vec<crate::scene::NodeId>,
+    pub transp_nodes: Vec<crate::scene::NodeId>,
+    /// Smoke / fire volumes for the path tracer.
+    pub volumes: Vec<Arc<crate::fluid::VolumeGeom>>,
     pub lights: Vec<GpuLight>,
     /// Texture layers (layer 0 = UV checker). Shared between frames while unchanged.
     pub textures: Option<Arc<crate::texture::TextureSet>>,

@@ -33,7 +33,7 @@ jobs:
             exe: rust_maya
             artifact: rust_maya-linux-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Linux build dependencies
         if: runner.os == 'Linux'
@@ -57,7 +57,7 @@ jobs:
         run: bash tools/ci_smoke.sh "target/release/${{ matrix.exe }}" smoke-out
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: target/release/${{ matrix.exe }}
@@ -65,7 +65,7 @@ jobs:
 
       - name: Upload smoke renders
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-renders-${{ runner.os }}
           path: smoke-out/

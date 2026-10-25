@@ -356,6 +356,8 @@ pub enum Shape {
     Field(crate::fx::Field),
     /// Hair system: dynamic strands grown from a mesh, or one dynamic curve.
     Hair(crate::hair::Hair),
+    /// Smoke / fire container (voxel fluid simulation, rendered as a volume).
+    Fluid(crate::fluid::Fluid),
     Poly {
         /// Construction history. `None` once history is deleted or components were edited.
         history: Option<Primitive>,
@@ -530,7 +532,7 @@ impl Node {
             Shape::Locator | Shape::Curve { .. } => Some(shape_name_for(&self.name)),
             Shape::Joint { .. } => None,
             Shape::IkHandle { .. } => None,
-            Shape::ClusterHandle | Shape::Light(_) | Shape::Camera(_) | Shape::Lattice { .. } | Shape::Particles(_) | Shape::Field(_) | Shape::Hair(_) => Some(format!("{}Shape", self.name)),
+            Shape::ClusterHandle | Shape::Light(_) | Shape::Camera(_) | Shape::Lattice { .. } | Shape::Particles(_) | Shape::Field(_) | Shape::Hair(_) | Shape::Fluid(_) => Some(format!("{}Shape", self.name)),
             Shape::Poly { .. } => Some(shape_name_for(&self.name)),
         }
     }
@@ -579,6 +581,10 @@ pub struct Scene {
     pub render_settings: Option<crate::raytrace::RenderSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_camera: Option<String>,
+    /// Frame particle simulations are taken from while the time is between frames (set by
+    /// motion-blurred renders so both shutter ends see the same particles).
+    #[serde(skip)]
+    pub sim_anchor: Option<f32>,
 }
 
 impl Default for Scene {
@@ -597,6 +603,7 @@ impl Default for Scene {
             poses: Vec::new(),
             render_settings: None,
             render_camera: None,
+            sim_anchor: None,
         }
     }
 }

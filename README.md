@@ -7,7 +7,7 @@ A Maya-style 3D content-creation app written in Rust with **egui** (UI) and **wg
 It covers the **UI, polygon and edge modeling, NURBS curves with surface tools, Quad Draw retopology, keyframe
 animation, character rigging (with deformers and a one-click biped Quick Rig), look development (materials, lights,
 cameras, shadows), UVs, a path tracer, glTF / USD import and export and an AI copilot**, plus
-particles and cloth simulation. Fluids, hair and Arnold rendering show up in the menus as greyed-out "planned" items.
+particles, cloth, hair and smoke / fire simulation. Bifrost and Arnold show up in the menus as greyed-out "planned" items.
 
 ![screenshot](docs/screenshot.png)
 
@@ -327,6 +327,45 @@ MEL: `airField -m 6 -dx 1 -dy 0 -dz 0 -s 2 -n wind flag fur`, `vortexField -m 4 
 Speed on the 2-core test VM: 1,000 strands × 8 segments on a colliding sphere in a turbulence field simulate at about
 27 ms/frame.
 
+### Smoke and fire (v2.5)
+
+FX › **Fluids** (or the *Smoke*, *Fire* and *Boom* shelf buttons, or `fluidPreset smoke|fire|explosion`) makes a ready-to-play effect. It uses the selected object as the source, or creates a new source and a container sized to it. Play the timeline to simulate; the viewport shows a translucent preview and the Render View path-traces the result.
+
+- **Container:** a voxel box (`fluidContainer -res 48 -size 4 6 4`) placed by its transform. It simulates incompressible flow (stable fluids):
+  - velocity, smoke density and temperature advected with MacCormack;
+  - a pressure projection;
+  - buoyancy from heat and weight from density;
+  - vorticity confinement (keeps swirls), noise turbulence and drag;
+  - cooling and dissipation;
+  - open sides and top with a closed floor (or a fully closed box).
+
+  Resolution is set along the longest side. Frames are cached (16-bit density and temperature), so scrubbing back is instant. Changing a look attribute re-renders without re-simulating.
+- **Emitters:** `fluidEmitter source container` (or FX › Fluids › Add Emitter).
+  - A mesh emits from its surface (deforming and skinned meshes included), a particle system from every particle, and anything else from a sphere around its pivot.
+  - Each source has density and heat rates, a radius, a speed along its up axis, how much of its own motion the smoke inherits, a duration (short bursts) and an expansion that pushes outward (explosions).
+- **Forces and collisions:** the same fields as particles, cloth and hair push the smoke (`connectDynamic -f windField container`). Colliders block it (`connectDynamic -c mesh container`, or Make Collide).
+- **Rendering:** smoke is a participating medium in the path tracer.
+  - Smoke scatters and absorbs (delta tracking with a per-brick majorant grid, Henyey–Greenstein phase), casts soft shadows and is lit by every light.
+  - Fire glows with a temperature-driven colour ramp and is sampled as a light, so flames light the scene.
+  - Smoke and fire show up in the light-path passes (emission, direct / indirect), the ID passes and mattes (`-mattes campfire`), and motion blur (at mid-shutter).
+  - The Attribute Editor's *Fluid* section has the smoke colour, density scale, anisotropy, fire intensity, colour and threshold.
+- **Export:** FX › Fluids › Export VDB Sequence… (`fluidExport -dir C:/out -s 1 -e 120`) writes OpenVDB files (`density` and `temperature` float grids, world space) for Houdini, Blender, Maya Bifrost or Unreal. USD export writes a `Volume` prim whose `OpenVDBAsset` fields point at per-frame VDB files written next to the .usda (in `<name>_vdb/`). The files were checked with OpenVDB's `vdb_print` and Python module and with USD's `UsdVol`. glTF has no volumes, so containers are skipped there.
+- **The AI director** knows them too: "a robot by a campfire with smoke" adds the effects, and `fxPreset smoke|fire|explosion [-wind]` works from MEL.
+
+```
+fluidPreset fire                                   (a campfire at the origin)
+fluidPreset smoke chimney -n chimneySmoke          (smoke from the chimney mesh)
+fluidContainer -res 64 -size 6 8 6 -p 0 4 0 -n box; fluidEmitter -dens 6 -heat 4 -r 0.5 torch box
+setAttr box.vorticity 4; setAttr box.fireIntensity 5; airField -m 3 -dx 1 box
+fluidExport -dir C:/renders/vdb -s 1 -e 120 box
+```
+
+Speed on the 2-core test VM: the fire preset (29×48×29 voxels) simulates at about 50 ms/frame. The explosion (64 voxels on its longest side) takes about 0.35 s/frame. A 400×400, 64-sample render takes about 1–2 minutes.
+
+![Smoke, a campfire lighting its surroundings, and an explosion (path-traced)](docs/render25.png)
+
+![The viewport preview and the Fluid section of the Attribute Editor](docs/fluid_viewport.png)
+
 ## Rendering: path tracer and Render View (v1.1)
 
 Status line **🎬** (or Rendering › Render › Render Current Frame, the *Render* shelf button, or `render`) renders the active view — or any camera — with a built-in multi-threaded **CPU path tracer** into the **Render View** window. The image refines progressively; **IPR** re-renders automatically whenever geometry, materials, lights, the camera or the settings change (selection changes don't).
@@ -367,6 +406,29 @@ render -o C:/r/shot.exr -passes specular,emission                           (MEL
 ```
 
 ![Motion blur off / on with a 1-frame shutter, then the diffuse direct, diffuse indirect, specular and emission passes](docs/render22.png)
+
+### Simulation motion blur, ID mattes and render-farm options (v2.4)
+
+- **Simulations blur at any shutter length.** Between frames, cloth and hair blend to the next simulated frame. Particles move along their velocity from the frame the render is centred on, so both ends of the shutter see the same particles. The viewport and scrubbing also show these in-between states.
+- **Rigs evaluate in batch renders:** sequence and command-line renders now evaluate constraints, IK, driven keys and simulations at every frame, exactly as the viewport does. Before, only keyframes were applied.
+- **ID passes:** **Object ID** is now antialiased: each pixel blends the colours of the objects it covers by coverage, using every sample. A new **Material ID** pass colours by assigned material. Colours stay the same from frame to frame.
+- **Mattes:** `-mattes` writes coverage mattes for compositing (grey PNG, or float EXR) as `name_matte_<name>.png`. Accepted values:
+  - `all`: one matte per object;
+  - `materials`: one per material;
+  - a comma-separated list of object, group (the matte covers everything under it) or material names.
+
+  Each pixel's object mattes add up to its alpha, and edges and motion blur are soft. It works with `render -o`, `renderView -save` and the batch renderer.
+- **Render farm:**
+  - `-chunk 2/4` renders the 2nd of 4 contiguous blocks of the range, so several machines with the same scene and options can share a sequence.
+  - `-step 2` renders every 2nd frame.
+  - `-resume` skips frames that are already finished. Each frame's image is written under a temporary name and renamed when complete, so an interrupted frame is rendered again.
+
+```
+rust_maya --render shot.rma -all -chunk 1/3 -resume -mattes hero,materials -o /srv/renders/shot.png   (machine 1 of 3)
+render -o C:/r/still.exr -mattes all            renderView -save C:/r/now.png -mattes hero
+```
+
+![Motion blur including particles, the antialiased object-ID and material-ID passes, and a material matte](docs/render24.png)
 
 ## Performance (v0.6)
 
@@ -516,13 +578,14 @@ src/
   fx.rs          particles, cloth (with self-collision) and fields: emitters, forces, collisions, PBD cloth,
                  per-frame caches, FX MEL
   hair.rs        hair systems and dynamic curves (DFTL strands, rest-shape stiffness, collisions)
+  fluid.rs       smoke / fire containers: stable-fluids solver, emitters, presets, preview, VDB export
   director.rs    "make a shot": characters, themed sets, shot cameras, FX presets, text → makeShot
   rig_report.rs  rig explainer (rigReport) and skin weight normalising
   posing.rs      pose command and the plain-English pose parser
   modeling_ops.rs undoable edge-modeling actions
   prefs.rs       preferences, recent files, autosave and crash recovery
   look.rs        materials, lights, cameras, look-through, GPU light setup
-  export/        glTF 2.0 (.glb/.gltf) and USD (.usda) exporters with animation baking
+  export/        glTF 2.0 (.glb/.gltf) and USD (.usda) exporters with animation baking, OpenVDB writer
   importer/      glTF 2.0 and USD (.usd/.usda/.usdc/.usdz: parser, composition, MaterialX, UsdSkel) importers
   fbx/           FBX node tree (binary reader/writer, ASCII reader), FBX importer and exporter
   reduce.rs      Mesh › Reduce (quadric decimation) and Soften / Harden Edge
@@ -545,7 +608,7 @@ src/
 
 These items appear in the UI as disabled "planned" entries:
 - Modeling: NURBS surfaces as true NURBS (today surface tools output polygons)
-- USD value clips, FBX NURBS curves, sub-frame simulation motion blur
-- FX: fluids, hair clumping / shading models, cloth tearing
+- USD value clips, FBX NURBS curves, multi-channel Cryptomatte EXR
+- FX: liquids, hair clumping / shading models, cloth tearing; true MAC-grid fluids for finer explosions
 
 *Not affiliated with Autodesk. Maya is a trademark of Autodesk, Inc.*

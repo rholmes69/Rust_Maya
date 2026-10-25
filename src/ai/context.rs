@@ -54,6 +54,18 @@ pub fn scene_summary(app: &App) -> String {
                 if f.max_distance > 0.0 { format!(", max distance {:.2}", f.max_distance) } else { String::new() },
                 if f.targets.is_empty() { "all simulations".to_string() } else { f.targets.iter().filter_map(|i| sc.node(*i)).map(|n| n.name.clone()).collect::<Vec<_>>().join(", ") }
             ),
+            Shape::Fluid(f) => {
+                let st = &f.settings;
+                let (d, _) = st.dims();
+                let srcs: Vec<String> = st.sources.iter().filter_map(|s| sc.node(s.node)).map(|x| x.name.clone()).collect();
+                format!(
+                    "{} container ({}x{}x{} voxels, size {:.1}x{:.1}x{:.1}, sources: {}, buoyancy {:.1}, fire {:.1})",
+                    if st.fire_intensity > 0.0 { "fire/smoke" } else { "smoke" },
+                    d[0], d[1], d[2], st.size[0], st.size[1], st.size[2],
+                    if srcs.is_empty() { "none".to_string() } else { srcs.join(", ") },
+                    st.buoyancy, st.fire_intensity
+                )
+            }
             Shape::Hair(h) => {
                 let st = &h.settings;
                 let src = st.source.and_then(|i| sc.node(i)).map(|x| x.name.clone()).unwrap_or_else(|| "?".into());
@@ -255,6 +267,7 @@ fn shape_kind(s: &Shape) -> &'static str {
         Shape::Particles(_) => "particles",
         Shape::Field(_) => "field",
         Shape::Hair(_) => "hair",
+        Shape::Fluid(_) => "fluid",
         Shape::Curve { .. } => "curve",
         Shape::Poly { history: Some(p), .. } => p.base_name(),
         Shape::Poly { .. } => "mesh",

@@ -22,9 +22,18 @@ grep -q -- "--render" "$OUT/help.txt"
 # A still with motion blur and every pass, then a short EXR sequence.
 "$BIN" --render "$SCENE" -mel "$MEL" -f 12 -x 320 -y 180 -spp 16 -env 0.4 -mb on -shutter 1 -passes -o "$OUT/still.png"
 "$BIN" --render "$SCENE" -mel "$MEL" -s 1 -e 3 -x 160 -y 90 -spp 4 -o "$OUT/seq/frame.exr"
+# Two "machines" sharing frames 1-6 with mattes, then a resume that has nothing left to do.
+"$BIN" --render "$SCENE" -mel "$MEL" -s 1 -e 6 -chunk 1/2 -x 96 -y 54 -spp 2 -mattes all -o "$OUT/farm/f.png"
+"$BIN" --render "$SCENE" -mel "$MEL" -s 1 -e 6 -chunk 2/2 -x 96 -y 54 -spp 2 -mattes all -o "$OUT/farm/f.png"
+"$BIN" --render "$SCENE" -mel "$MEL" -s 1 -e 6 -resume -x 96 -y 54 -spp 2 -o "$OUT/farm/f.png" | tee "$OUT/resume.txt"
+grep -q "6 already done" "$OUT/resume.txt"
+# Smoke and fire: a fire preset rendered without a window, plus its VDB export.
+"$BIN" --render "$SCENE" -mel "polyPlane -w 8 -h 8 -n ground; fluidPreset fire -n camp; camera -n fcam -p 0 2 6 -aim 0 1.2 0; fluidExport -dir \"$OUT/vdb\" -s 10 -e 11 camp" -cam fcam -f 24 -x 120 -y 90 -spp 8 -o "$OUT/fire.png"
 
 for f in still_beauty.png still_albedo.png still_depth.png still_diffuse_direct.png still_diffuse_indirect.png \
-         still_specular.png still_emission.png seq/frame.0001.exr seq/frame.0002.exr seq/frame.0003.exr; do
+         still_specular.png still_emission.png still_materialid.png seq/frame.0001.exr seq/frame.0002.exr seq/frame.0003.exr \
+         farm/f.0001.png farm/f.0006.png farm/f_matte_red.0003.png farm/f_matte_ring.0004.png \
+         fire.png vdb/camp.0010.vdb vdb/camp.0011.vdb; do
   [ -s "$OUT/$f" ] || { echo "missing output: $f"; exit 1; }
 done
 

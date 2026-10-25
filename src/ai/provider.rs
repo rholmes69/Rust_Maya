@@ -77,13 +77,33 @@ pub struct Endpoints {
     pub openrouter_url: String,
 }
 
+/// One agent per worker thread: its connection pool keeps the Ollama socket alive between
+/// requests, and TCP_NODELAY stops Nagle from batching small streamed chunks.
 pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(4)))
         .timeout_per_read(Some(std::time::Duration::from_secs(300)))
+        .no_delay(true)
+        .max_idle_connections(8)
+        .max_idle_connections_per_host(4)
+        .max_idle_age(std::time::Duration::from_secs(300))
         .http_status_as_error(false)
         .build()
         .into()
+}
+
+/// Ollama: keep models resident in VRAM between requests.
+pub const OLLAMA_KEEP_ALIVE: i64 = -1;
+/// Builder / task requests. The static system prompt alone is ~5.6k tokens (MEL reference), so
+/// 4096 would truncate it; 8192 still fits fully on an 8 GB GPU for 8B Q4 models.
+pub const OLLAMA_BUILD_CTX: u32 = 8192;
+pub const OLLAMA_BUILD_PREDICT: i32 = 1536;
+/// Decision model (tev1) requests: short prompt, tool call or tiny JSON reply.
+pub const OLLAMA_DECIDE_CTX: u32 = 4096;
+pub const OLLAMA_DECIDE_PREDICT: i32 = 512;
+
+fn ollama_options(temperature: f32, num_ctx: u32, num_predict: i32) -> Value {
+    json!({"temperature": temperature, "num_ctx": num_ctx, "num_predict": num_predict})
 }
 
 fn or_key(ep: &Endpoints) -> Result<String, String> {
@@ -230,8 +250,8 @@ fn ollama_stream(
         "messages": messages,
         "stream": true,
         "think": false,
-        "keep_alive": "30m",
-        "options": {"temperature": temperature, "num_ctx": 8192}
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": ollama_options(temperature, OLLAMA_BUILD_CTX, OLLAMA_BUILD_PREDICT)
     });
     if let Some(s) = json_schema {
         body["format"] = s.clone();
@@ -247,13 +267,18 @@ fn ollama_stream(
             }
             return Err(format!("Ollama error: {err}"));
         }
-        let reader = std::io::BufReader::new(resp.into_body().into_with_config().limit(64 << 20).reader());
+        // NDJSON: one object per token chunk. Reuse one line buffer instead of allocating per chunk.
+        let mut reader = std::io::BufReader::new(resp.into_body().into_with_config().limit(64 << 20).reader());
         let mut all = String::new();
-        for line in reader.lines() {
+        let mut line = String::new();
+        loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
             }
-            let line = line.map_err(|e| friendly(&e.to_string(), model))?;
+            line.clear();
+            if reader.read_line(&mut line).map_err(|e| friendly(&e.to_string(), model))? == 0 {
+                break;
+            }
             if line.trim().is_empty() {
                 continue;
             }
@@ -355,8 +380,8 @@ pub fn chat_tools(
                 "model": m.model,
                 "messages": messages,
                 "stream": false,
-                "keep_alive": "30m",
-                "options": {"temperature": 0.0, "num_ctx": 4096}
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+                "options": ollama_options(0.0, OLLAMA_DECIDE_CTX, OLLAMA_DECIDE_PREDICT)
             });
             if let Some(t) = tools {
                 body["tools"] = t.clone();

@@ -98,6 +98,10 @@ FX (simulations play with the timeline; set playbackOptions first; currentTime N
   airField -m 5 -dx 1 -dy 0 -dz 0 [-s 1] (wind)  gravityField  uniformField  radialField -m 5 -att 1  vortexField -m 4 (axis = -dx/-dy/-dz)
   turbulenceField -m 3 -f 1  dragField -m 0.5  newtonField -m 5 (attractor)  [-mxd maxDistance] [-p x y z] [-n name] [targets]
   connectDynamic -f gust cape (restrict a field to a target)   connectDynamic -rf gust cape   setAttr gust.magnitude 8
+  SMOKE/FIRE: fluidPreset smoke|fire|explosion [sourceObj] [-n name]   fluidContainer [-res 48] [-size 4 6 4] [-p x y z] [-n name]
+      fluidEmitter [-dens 4] [-heat 5] [-r 0.35] [-spd 0] [-dur 0] [-exp 0] sourceObj container   (mesh/particles/locator sources)
+      setAttr smokeFluid.buoyancy 6 | .vorticity 3 | .turbulence 2 | .cooling 0.4 | .dissipation 0.1 | .fireIntensity 6 | .densityScale 6 | .smokeColor r g b
+      connectDynamic -c colliderMesh container   connectDynamic -f windField container   fluidExport -dir C:/path [-s 1 -e 48] container (OpenVDB)
   HAIR: hairSystem [-count 400] [-length 0.3] [-seg 8] [-curl 20] [-stiff 0.25] [-width 0.01] [-rgb r g b] [-n hair] headMesh
       (strands follow the deforming mesh; setAttr hair.stiffness/tipStiffness/combAmount/comb x y z/drag/gravity; connectDynamic -c body hair)
   makeCurvesDynamic [-pinTip] rope   (creates rope_dyn, a curve that swings; use it for wires, extrude, emitters)   hairToCurves hair
@@ -115,17 +119,17 @@ DIRECTOR (whole shots in one statement each):
       [-mood studio|outdoor|sunset|night|product|dramatic] [-camera static|track|dolly|orbit|crane] [-fx rain|snow|sparks|fireflies|dust|leaves|cape|flag]...
       [-wind] [-s 1 -e 120] [-clear]   builds set + character + rig/animation + FX + light rig + render settings + shotCam, looks through it
   character -style human|robot|alien [-h 1.8] [-p x y z] -n hero   environment -theme forest [-size 24] [-density 1] [-seed 7]
-  shotCamera -type static|track|dolly|orbit|crane [-target hero] [-s 1 -e 120] [-n shotCam]   fxPreset rain|snow|...|cape|flag [-wind]
+  shotCamera -type static|track|dolly|orbit|crane [-target hero] [-s 1 -e 120] [-n shotCam]   fxPreset rain|snow|...|cape|flag|smoke|fire|explosion [-wind]
 POSING (Quick Rig controls; FK joints if there are no controls):
   pose -part arm|elbow|leg|knee|foot|head|chest|hips [-side L|R|both] -action raise|lower|forward|back|out|in|bend|straighten|lift|step|
       turn|nod|tilt|lean|twist|crouch|stand|shift [-dir left|right|forward|back|up|down] [-amount small|large|<degrees>|<n>cm] [-key]
       e.g. "pose -part arm -side L -action raise -amount 40", "pose -part head -action turn -dir right", "pose -part hips -action crouch -key"
 RIG CHECK: rigReport (explains skeleton, IK, controls, skins and lists problems with fix statements)   skinPercent -normalize mesh
 RENDER: render [-x 960 -y 540] [-spp 64] [-cam cameraName] [-o C:/path/out.png]   (CPU path tracer → Render View; -o saves a still)
-  render -o C:/path/shot.png -passes [specular,emission] (beauty/albedo/normal/depth/objectid/diffuse_direct/diffuse_indirect/specular/emission; .exr = float)
+  render -o C:/path/shot.png -passes [specular,emission] (beauty/albedo/normal/depth/objectid/materialid/diffuse_direct/diffuse_indirect/specular/emission; .exr = float)
   renderSettings -mb on -shutter 0.5 (motion blur)   renderSettings -region 0.2 0.2 0.6 0.6 | -region off
   camera depth of field: setAttr cam.depthOfField 1; setAttr cam.fStop 2.8; setAttr cam.focusDistance 6; setAttr cam.dofBlurScale 20
-  render -seq -st 1 -e 24 -o C:/path/name   renderSettings -spp 128 -env 0.3 -exp 0.5 -tm filmic -bg env -dn on   renderView -ipr on|off
+  render -o C:/path/shot.png -mattes all|materials|hero,car (ID mattes)   render -seq -st 1 -e 24 -o C:/path/name [-resume]   renderSettings -spp 128 -env 0.3 -exp 0.5 -tm filmic -bg env -dn on   renderView -ipr on|off
 IMPORT: file -import C:/path/model.glb [-take Walk] | .gltf | .obj   (brings in meshes, materials/textures, skins, blend shapes, animation)
   file -import C:/path/character.fbx [-take Run]   (FBX 2011+ binary/ASCII: Mixamo/Maya/Blender/Max characters, skins, blend shapes, takes)
   file -import C:/path/stage.usd | .usda | .usdc | .usdz   (USD: composes subLayers/references/payloads/variants/inherits, UsdSkel characters,

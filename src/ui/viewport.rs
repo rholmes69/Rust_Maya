@@ -1327,6 +1327,11 @@ fn pick_object(app: &App, pr: &Projector, m: Vec2) -> Option<NodeId> {
             }
             Shape::Locator | Shape::IkHandle { .. } | Shape::ClusterHandle => wire(near_poly(&[origin], false, 8.0)),
             Shape::Particles(_) | Shape::Field(_) => wire(near_poly(&[origin], false, 12.0)),
+            Shape::Fluid(f) => {
+                for (a, b) in crate::fluid::box_lines(&f.settings) {
+                    wire(near_poly(&[w.transform_point3(a), w.transform_point3(b)], false, 5.0));
+                }
+            }
             Shape::Hair(h) => {
                 for st in h.strands().iter().take(400) {
                     wire(near_poly(st, false, 5.0));

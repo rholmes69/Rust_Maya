@@ -641,6 +641,8 @@ pub fn evaluate(scene: &mut Scene) {
     }
     // Simulations (particles, cloth) catch up to the current frame.
     crate::fx::update(scene);
+    // Smoke and fire (after particles, which can feed them).
+    crate::fluid::update(scene);
     // Hair; dynamic curves rewrite their output curves, so surfaces built from them update too.
     if crate::hair::update(scene) {
         crate::nurbs::update_history(scene);

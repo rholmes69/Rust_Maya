@@ -31,8 +31,17 @@ OPTIONS:
     -bg env|black      Background
     -mb on|off         Motion blur
     -shutter <frames>  Shutter length in frames (turns motion blur on; 0.5 = 180°)
-    -passes            Also save the passes: albedo, normal, depth, object id, diffuse direct,
-                       diffuse indirect, specular, emission (name_<pass>[.####].png/.exr)
+    -passes            Also save the passes: albedo, normal, depth, object id, material id,
+                       diffuse direct, diffuse indirect, specular, emission
+                       (name_<pass>[.####].png/.exr)
+    -mattes <list>     Antialiased ID mattes (name_matte_<name>[.####].png/.exr): `all` (one per
+                       object), `materials` (one per material), or comma-separated object, group
+                       or material names
+    -step <n>          Render every n-th frame of the range
+    -chunk <i>/<n>     Render only part i of n of the range (contiguous blocks), so n machines
+                       can share a sequence: run -chunk 1/4 … -chunk 4/4 with the same options
+    -resume            Skip frames whose image already exists (finished frames are written
+                       under a temporary name first, so interrupted frames are redone)
     -mel \"<commands>\"  Run MEL commands after loading, before rendering
     -q                 Quiet: only errors
     -h, --help         This help
@@ -40,6 +49,7 @@ OPTIONS:
 EXAMPLES:
     rust_maya --render shot.rma -s 1 -e 120 -o renders/shot.png
     rust_maya --render shot.rma -f 48 -x 1920 -y 1080 -spp 256 -mb on -passes -o out/f48.exr
+    rust_maya --render shot.rma -all -chunk 2/3 -resume -mattes hero,materials -o /srv/shot.png
 
 Exit codes: 0 = success, 1 = render or file error, 2 = bad arguments.
 ";
@@ -68,8 +78,8 @@ fn run_inner(args: &[String]) -> Result<(), Fail> {
     let scene_path = args.first().filter(|a| !a.starts_with('-')).ok_or_else(|| usage("--render needs a scene file"))?;
     let mut opts = std::collections::HashMap::<String, String>::new();
     let mut flags = std::collections::HashSet::<String>::new();
-    let takes_value = ["-cam", "-camera", "-f", "-s", "-e", "-o", "-x", "-y", "-spp", "-b", "-env", "-exp", "-tm", "-dn", "-bg", "-mb", "-shutter", "-mel"];
-    let switches = ["-all", "-passes", "-q"];
+    let takes_value = ["-cam", "-camera", "-f", "-s", "-e", "-o", "-x", "-y", "-spp", "-b", "-env", "-exp", "-tm", "-dn", "-bg", "-mb", "-shutter", "-mel", "-mattes", "-step", "-chunk"];
+    let switches = ["-all", "-passes", "-q", "-resume"];
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
@@ -154,9 +164,30 @@ fn run_inner(args: &[String]) -> Result<(), Fail> {
     }
     let out = opts.get("-o").cloned().unwrap_or_else(|| path.with_extension("png").to_string_lossy().into_owned());
     let passes = flags.contains("-passes");
+    let mattes = opts.get("-mattes").cloned();
+    let resume = flags.contains("-resume");
+    let step = match num("-step")? {
+        Some(v) if v >= 1.0 => v as i32,
+        Some(_) => return Err(usage("-step must be 1 or more")),
+        None => 1,
+    };
+    let mut frames: Vec<i32> = (start..=end).step_by(step as usize).collect();
+    let mut part = String::new();
+    if let Some(c) = opts.get("-chunk") {
+        let (i, n) = c.split_once('/').and_then(|(a, b)| Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))).filter(|&(i, n)| n >= 1 && (1..=n).contains(&i)).ok_or_else(|| usage(format!("-chunk '{c}': expected i/n with 1 ≤ i ≤ n, e.g. 2/4")))?;
+        let len = frames.len();
+        frames = frames[len * (i - 1) / n..len * i / n].to_vec();
+        part = format!(" (chunk {i}/{n})");
+    }
+    let seq = seq || step > 1 || opts.contains_key("-chunk") || resume;
+    if frames.is_empty() {
+        say(format!("Nothing to render{part}: the chunk is empty."));
+        return Ok(());
+    }
+    let (start, end) = (frames[0], *frames.last().unwrap());
 
     say(format!(
-        "Rendering {} — {}x{}, {} spp, {} bounces{}, camera {}, frame{} {}",
+        "Rendering {} — {}x{}, {} spp, {} bounces{}, camera {}, frame{} {}{part}",
         path.display(),
         settings.width,
         settings.height,
@@ -164,34 +195,51 @@ fn run_inner(args: &[String]) -> Result<(), Fail> {
         settings.bounces,
         if settings.motion_blur { format!(", motion blur {} fr", settings.shutter) } else { String::new() },
         cam_name.as_deref().unwrap_or("persp (default)"),
-        if start == end { "" } else { "s" },
-        if start == end { start.to_string() } else { format!("{start}-{end}") },
+        if frames.len() == 1 { "" } else { "s" },
+        if frames.len() == 1 { start.to_string() } else if step > 1 { format!("{start}-{end} every {step}") } else { format!("{start}-{end}") },
     ));
     let t0 = std::time::Instant::now();
-    let total = (end - start + 1) as usize;
+    let total = frames.len();
+    let mut rendered = total;
     if seq {
-        let mut done = 0usize;
-        app.render_frames(cam_name.as_deref(), settings, start, end, &out, passes, &mut |f, secs, files| {
+        let (mut done, mut skipped, mut timed) = (0usize, 0usize, 0usize);
+        let fo = crate::render_view::FrameOutput { passes, mattes, skip_existing: resume };
+        app.render_frames(cam_name.as_deref(), settings, &frames, &out, &fo, &mut |f, secs, files| {
             done += 1;
+            if secs < 0.0 {
+                skipped += 1;
+                if !quiet {
+                    println!("[{done}/{total}] frame {f}: already done, skipped");
+                }
+                return;
+            }
+            timed += 1;
             if !quiet {
+                // ETA from the frames actually rendered this run.
                 let el = t0.elapsed().as_secs_f32();
-                let eta = el / done as f32 * (total - done) as f32;
+                let eta = el / timed as f32 * (total - done) as f32;
                 println!("[{done}/{total}] frame {f}: {secs:.1}s → {}{}", files.first().map(String::as_str).unwrap_or(""), if done < total { format!("  (ETA {})", fmt_secs(eta)) } else { String::new() });
             }
         })
         .map_err(|e| (1, e))?;
+        rendered = total - skipped;
     } else {
         app.set_time(start as f32);
         let mut job = app.render_now(cam_name.as_deref(), settings.clone()).map_err(|e| (1, e))?;
-        let files = if passes {
+        let mut files = if passes {
             job.save_passes(std::path::Path::new(&out), settings.exposure, settings.tonemap).map_err(|e| (1, e))?
         } else {
             job.save_png(std::path::Path::new(&out), settings.exposure, settings.tonemap).map_err(|e| (1, e))?;
             vec![out.clone()]
         };
+        if let Some(spec) = &mattes {
+            let ext = std::path::Path::new(&out).extension().and_then(|e| e.to_str()).unwrap_or("png").to_string();
+            files.extend(app.save_mattes(&job, spec, crate::render_view::base_without_ext(&out), None, &ext).map_err(|e| (1, e))?);
+        }
         say(format!("frame {start}: {:.1}s → {}", job.elapsed().as_secs_f32(), files.join(", ")));
     }
-    say(format!("Done: {total} frame{} in {}{}", if total == 1 { "" } else { "s" }, fmt_secs(t0.elapsed().as_secs_f32()), if seq { format!(" ({} …)", frame_path(&out, start)) } else { String::new() }));
+    let skipped = if rendered < total { format!(", {} already done", total - rendered) } else { String::new() };
+    say(format!("Done: {rendered} frame{} in {}{skipped}{}", if rendered == 1 { "" } else { "s" }, fmt_secs(t0.elapsed().as_secs_f32()), if seq { format!(" ({} …)", frame_path(&out, start)) } else { String::new() }));
     Ok(())
 }
 
@@ -263,6 +311,41 @@ mod tests {
         assert_eq!(run(&s(&[&sc, "-bogus"])), 2);
         assert_eq!(run(&s(&[&sc, "-cam", "nope", "-q"])), 1);
         assert_eq!(run(&s(&["missing.rma"])), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_chunks_steps_resumes_and_mattes() {
+        let dir = std::env::temp_dir().join(format!("rm_batch2_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut app = App::new();
+        crate::commands::execute(&mut app, "polySphere -n ball; polyCube -n crate; move 2 0 0 crate; camera -n cam -p 0 1 8 -aim 0 0 0; renderSettings -x 24 -y 16 -spp 1 -cam cam").unwrap();
+        let scene = dir.join("s.rma");
+        app.save_to(scene.clone());
+        let sc = scene.to_string_lossy().into_owned();
+        let out = dir.join("r/f.png").to_string_lossy().into_owned();
+        let exists = |f: i32| std::path::Path::new(&frame_path(&out, f)).exists();
+        // Frames 1..=10 split in 3: [1,2,3] [4,5,6] [7..10].
+        assert_eq!(run(&s(&[&sc, "-s", "1", "-e", "10", "-chunk", "2/3", "-o", &out, "-q"])), 0);
+        assert_eq!((1..=10).filter(|&f| exists(f)).collect::<Vec<_>>(), vec![4, 5, 6]);
+        // Every 4th frame of 1..=10: 1, 5 (exists), 9.
+        let before = std::fs::metadata(frame_path(&out, 5)).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(run(&s(&[&sc, "-s", "1", "-e", "10", "-step", "4", "-resume", "-o", &out, "-q"])), 0);
+        assert_eq!((1..=10).filter(|&f| exists(f)).collect::<Vec<_>>(), vec![1, 4, 5, 6, 9]);
+        assert_eq!(std::fs::metadata(frame_path(&out, 5)).unwrap().modified().unwrap(), before, "resume skipped frame 5");
+        // No temporary files left behind.
+        let names: Vec<String> = std::fs::read_dir(dir.join("r")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|n| !n.contains("partial")), "{names:?}");
+        // Mattes per frame, and bad chunk specs.
+        assert_eq!(run(&s(&[&sc, "-s", "2", "-e", "3", "-mattes", "all", "-o", &out, "-q"])), 0);
+        assert!(dir.join("r/f_matte_ball.0002.png").exists() && dir.join("r/f_matte_crate.0003.png").exists());
+        assert_eq!(run(&s(&[&sc, "-mattes", "ghost", "-o", &out, "-q"])), 1);
+        for bad in ["0/3", "4/3", "x", "2/0"] {
+            assert_eq!(run(&s(&[&sc, "-s", "1", "-e", "3", "-chunk", bad, "-q"])), 2, "{bad}");
+        }
+        // A chunk can be empty when there are fewer frames than machines.
+        assert_eq!(run(&s(&[&sc, "-s", "1", "-e", "2", "-chunk", "1/3", "-o", &out, "-q"])), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

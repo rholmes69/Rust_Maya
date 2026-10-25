@@ -1,6 +1,6 @@
 [package]
 name = "rust_maya"
-version = "2.3.0"
+version = "2.5.0"
 rust-version = "1.96"
 edition = "2024"
 

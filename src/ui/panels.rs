@@ -183,6 +183,7 @@ fn outliner_row(app: &mut App, ui: &mut egui::Ui, id: NodeId, depth: usize, drag
         Shape::Particles(_) => ("✺", Color32::from_rgb(255, 180, 90)),
         Shape::Field(_) => ("➶", Color32::from_rgb(140, 230, 200)),
         Shape::Hair(_) => ("〰", Color32::from_rgb(220, 170, 120)),
+        Shape::Fluid(_) => ("☁", Color32::from_rgb(150, 190, 235)),
         Shape::Poly { .. } => ("◼", Color32::from_rgb(120, 200, 230)),
     };
     let visible = app.scene.is_visible(id);
@@ -954,6 +955,83 @@ pub fn attribute_editor(app: &mut App, ui: &mut egui::Ui) {
             app.edit_checkpoint(egui::Id::unique(("ae_hair", lead)));
             if let Some(Shape::Hair(h)) = app.scene.node_mut(lead).map(|n| &mut n.shape) {
                 h.settings = st;
+            }
+        }
+    }
+    if let Shape::Fluid(fl) = &node.shape {
+        let mut st = fl.settings.clone();
+        let (dims, _) = st.dims();
+        let stats = fl.current().map(|c| (c.dmax, c.tmax));
+        let mut changed = false;
+        let mut sim_changed = false;
+        egui::CollapsingHeader::new("Fluid (smoke / fire)").default_open(true).show(ui, |ui| {
+            ui.label(format!("{} × {} × {} voxels{}", dims[0], dims[1], dims[2], stats.map(|(d, t)| format!("  ·  max density {d:.2}, temperature {t:.2}")).unwrap_or_default()));
+            ui.horizontal(|ui| {
+                ui.label("Resolution");
+                sim_changed |= ui.add(egui::DragValue::new(&mut st.res).range(4..=256)).on_hover_text("Voxels along the longest side").changed();
+                ui.label("Size");
+                for k in 0..3 {
+                    sim_changed |= ui.add(egui::DragValue::new(&mut st.size[k]).speed(0.05).range(0.01..=1000.0)).changed();
+                }
+            });
+            sim_changed |= ae_row(ui, "Buoyancy", &mut st.buoyancy, 0.05, -100.0, 100.0);
+            sim_changed |= ae_row(ui, "Weight", &mut st.weight, 0.01, -10.0, 10.0);
+            sim_changed |= ae_row(ui, "Cooling", &mut st.cooling, 0.01, 0.0, 20.0);
+            sim_changed |= ae_row(ui, "Dissipation", &mut st.dissipation, 0.01, 0.0, 20.0);
+            sim_changed |= ae_row(ui, "Vorticity", &mut st.vorticity, 0.05, 0.0, 50.0);
+            sim_changed |= ae_row(ui, "Turbulence", &mut st.turbulence, 0.05, 0.0, 100.0);
+            sim_changed |= ae_row(ui, "Turbulence frequency", &mut st.turbulence_freq, 0.05, 0.0, 50.0);
+            sim_changed |= ae_row(ui, "Drag", &mut st.drag, 0.01, 0.0, 10.0);
+            sim_changed |= ae_row(ui, "Start frame", &mut st.start, 1.0, -100_000.0, 100_000.0);
+            ui.horizontal(|ui| {
+                ui.label("Substeps");
+                sim_changed |= ui.add(egui::DragValue::new(&mut st.substeps).range(1..=16)).changed();
+                sim_changed |= ui.checkbox(&mut st.open, "Open boundaries").on_hover_text("Smoke leaves through the sides and top; the bottom is always closed").changed();
+            });
+            ui.separator();
+            ui.label("Sources");
+            let mut remove = None;
+            let n_src = st.sources.len();
+            for (k, src) in st.sources.iter_mut().enumerate() {
+                let nm = app.scene.node(src.node).map(|n| n.name.clone()).unwrap_or_else(|| "?".into());
+                egui::CollapsingHeader::new(nm.clone()).id_salt(("fluid_src", lead, k)).default_open(n_src <= 2).show(ui, |ui| {
+                    sim_changed |= ae_row(ui, "Density / s", &mut src.density, 0.05, 0.0, 10_000.0);
+                    sim_changed |= ae_row(ui, "Heat / s", &mut src.heat, 0.05, 0.0, 10_000.0);
+                    sim_changed |= ae_row(ui, "Radius", &mut src.radius, 0.01, 0.001, 1000.0);
+                    sim_changed |= ae_row(ui, "Speed", &mut src.speed, 0.05, -1000.0, 1000.0);
+                    sim_changed |= ae_row(ui, "Inherit motion", &mut src.inherit, 0.01, 0.0, 1.0);
+                    sim_changed |= ae_row(ui, "Duration (s, 0 = always)", &mut src.duration, 0.01, 0.0, 10_000.0);
+                    sim_changed |= ae_row(ui, "Expansion", &mut src.expansion, 0.05, 0.0, 1000.0);
+                    if ui.small_button("Remove source").clicked() {
+                        remove = Some(k);
+                    }
+                });
+            }
+            if let Some(k) = remove {
+                st.sources.remove(k);
+                sim_changed = true;
+            }
+            let cols: Vec<String> = st.colliders.iter().filter_map(|i| app.scene.node(*i)).map(|n| n.name.clone()).collect();
+            ui.label(format!("Colliders: {}", if cols.is_empty() { "—".into() } else { cols.join(", ") }));
+            ui.separator();
+            ui.label("Look (renders without re-simulating)");
+            ui.horizontal(|ui| {
+                ui.label("Smoke colour");
+                changed |= ui.color_edit_button_rgb(&mut st.smoke_color).changed();
+            });
+            changed |= ae_row(ui, "Density scale", &mut st.density_scale, 0.05, 0.0, 1000.0);
+            changed |= ae_row(ui, "Anisotropy", &mut st.anisotropy, 0.01, -0.95, 0.95);
+            changed |= ae_row(ui, "Fire intensity", &mut st.fire_intensity, 0.05, 0.0, 1000.0);
+            ui.horizontal(|ui| {
+                ui.label("Fire colour");
+                changed |= ui.color_edit_button_rgb(&mut st.fire_color).changed();
+            });
+            changed |= ae_row(ui, "Fire starts at temperature", &mut st.fire_temp, 0.01, 0.0, 100.0);
+        });
+        if changed || sim_changed {
+            app.edit_checkpoint(egui::Id::unique(("ae_fluid", lead)));
+            if let Some(Shape::Fluid(f)) = app.scene.node_mut(lead).map(|n| &mut n.shape) {
+                f.settings = st;
             }
         }
     }

@@ -2,6 +2,7 @@
 
 pub mod gltf;
 pub mod usd;
+pub mod vdb;
 
 use crate::app::App;
 use crate::scene::{NodeId, Scene};
@@ -95,6 +96,8 @@ pub struct Baked {
     pub particle_ids: HashMap<NodeId, Vec<Vec<u32>>>,
     /// Object-space hair strand points per frame (all strands, `segments + 1` points each).
     pub hair: HashMap<NodeId, Vec<Vec<Vec3>>>,
+    /// Fluid containers: an OpenVDB file image (container space) per frame.
+    pub fluids: HashMap<NodeId, Vec<Vec<u8>>>,
 }
 
 impl Baked {
@@ -107,7 +110,7 @@ impl Baked {
                 f += 1.0;
             }
         }
-        let mut b = Baked { frames, trs: HashMap::new(), weights: HashMap::new(), points: HashMap::new(), particles: HashMap::new(), particle_ids: HashMap::new(), hair: HashMap::new() };
+        let mut b = Baked { frames, trs: HashMap::new(), weights: HashMap::new(), points: HashMap::new(), particles: HashMap::new(), particle_ids: HashMap::new(), hair: HashMap::new(), fluids: HashMap::new() };
         if b.frames.len() < 2 {
             b.frames.clear();
             return b;
@@ -127,6 +130,9 @@ impl Baked {
                     let inv = sc.world_matrix(id).inverse();
                     b.particles.entry(id).or_default().push(ps.current().iter().map(|q| inv.transform_point3(q.p)).collect());
                     b.particle_ids.entry(id).or_default().push(ps.current().iter().map(|q| q.id).collect());
+                }
+                if matches!(n.shape, crate::scene::Shape::Fluid(_)) {
+                    b.fluids.entry(id).or_default().push(crate::fluid::vdb_for(&sc, id, false).unwrap_or_default());
                 }
                 if let crate::scene::Shape::Hair(h) = &n.shape {
                     let inv = sc.world_matrix(id).inverse();

@@ -1024,9 +1024,12 @@ impl App {
 
     // ------------------------------------------------------------ animation
 
+    /// Go to time `t`: animation curves, then the rig (driven keys, constraints, IK) and
+    /// simulations, so renders and batch jobs see the same pose as the viewport.
     pub fn set_time(&mut self, t: f32) {
         self.scene.time = t;
         self.scene.evaluate();
+        crate::rig::evaluate(&mut self.scene);
     }
 
     pub fn key_selected(&mut self, channels: &[Channel]) {
@@ -1344,9 +1347,13 @@ impl App {
         let mut any = false;
         for &id in ids {
             let w = self.scene.world_matrix(id);
-            let pts: Vec<Vec3> = match self.scene.node(id).and_then(|n| n.mesh()) {
-                Some(m) => m.positions.clone(),
-                None => vec![Vec3::ZERO],
+            let pts: Vec<Vec3> = match self.scene.node(id) {
+                Some(n) if n.mesh().is_some() => n.mesh().unwrap().positions.clone(),
+                Some(n) if matches!(n.shape, Shape::Fluid(_)) => {
+                    let Shape::Fluid(f) = &n.shape else { unreachable!() };
+                    crate::fluid::box_lines(&f.settings).into_iter().flat_map(|(a, b)| [a, b]).collect()
+                }
+                _ => vec![Vec3::ZERO],
             };
             for p in pts {
                 let q = w.transform_point3(p);
@@ -1469,6 +1476,10 @@ impl App {
             Shape::Hair(hs) => {
                 (hs.cache.version, hs.cache.current, hs.cache.key).hash(&mut h);
                 format!("{:?}", hs.settings).hash(&mut h);
+            }
+            Shape::Fluid(fl) => {
+                (fl.cache.version, fl.cache.current, fl.cache.key).hash(&mut h);
+                format!("{:?}", fl.settings).hash(&mut h);
             }
             other => format!("{other:?}").hash(&mut h),
         }
@@ -1617,6 +1628,28 @@ impl App {
                 }
                 continue;
             }
+            if let Shape::Fluid(fl) = &node.shape {
+                let c = if selected { wire_col } else { [0.45, 0.75, 0.95] };
+                for (a, b) in crate::fluid::box_lines(&fl.settings) {
+                    extra_wire.push(GpuVertex::line(w.transform_point3(a), c));
+                    extra_wire.push(GpuVertex::line(w.transform_point3(b), c));
+                }
+                let tris = crate::fluid::preview_tris(fl, w);
+                if !tris.is_empty() {
+                    let lo = tris.iter().fold(Vec3::splat(f32::MAX), |a, t| a.min(t.0));
+                    let hi = tris.iter().fold(Vec3::splat(f32::MIN), |a, t| a.max(t.0));
+                    let verts: Vec<GpuVertex> = tris
+                        .iter()
+                        .map(|(p, n, col)| GpuVertex { pos: p.to_array(), nrm: n.to_array(), col: *col, mat: GpuVertex::DEFAULT_MAT, emi: [0.0; 4], uv: [0.0; 2], maps: [0.0; 4] })
+                        .collect();
+                    g.tris_transp.push(Chunk::preview(verts, Some((lo, hi))));
+                    g.transp_nodes.push(id);
+                }
+                if let Some(v) = crate::fluid::VolumeGeom::from_fluid(id, w, fl) {
+                    g.volumes.push(Arc::new(v));
+                }
+                continue;
+            }
             if let Shape::Field(f) = &node.shape {
                 let c = if selected { wire_col } else { [0.55, 0.9, 0.8] };
                 for (a, b) in crate::fx::field_icon(f) {
@@ -1643,6 +1676,7 @@ impl App {
                         .map(|(p, n, col)| GpuVertex { pos: p.to_array(), nrm: n.to_array(), col: [col[0], col[1], col[2], 1.0], mat: GpuVertex::DEFAULT_MAT, emi: [0.0; 4], uv: [0.0; 2], maps: [0.0; 4] })
                         .collect();
                     g.tris.push(Chunk::with_bounds(verts, Some((lo, hi))));
+                    g.tri_nodes.push(id);
                 }
                 continue;
             }
@@ -1663,6 +1697,7 @@ impl App {
                         .map(|(p, n, col)| GpuVertex { pos: p.to_array(), nrm: n.to_array(), col: [col[0], col[1], col[2], 1.0], mat: GpuVertex::DEFAULT_MAT, emi: [0.0; 4], uv: [0.0; 2], maps: [0.0; 4] })
                         .collect();
                     g.tris.push(Chunk::with_bounds(verts, Some((lo, hi))));
+                    g.tri_nodes.push(id);
                 }
                 continue;
             }
@@ -1780,7 +1815,13 @@ impl App {
                 && c.key == key
             {
                 if let Some(t) = &c.tris {
-                    if c.transp { g.tris_transp.push(t.clone()) } else { g.tris.push(t.clone()) }
+                    if c.transp {
+                        g.tris_transp.push(t.clone());
+                        g.transp_nodes.push(id);
+                    } else {
+                        g.tris.push(t.clone());
+                        g.tri_nodes.push(id);
+                    }
                 }
                 if let Some(wc) = &c.wire {
                     g.wire_all.push(wc.clone());
@@ -1870,7 +1911,13 @@ impl App {
             }
             if !tri_v.is_empty() {
                 let t = Chunk::with_bounds(tri_v, bounds);
-                if chunk.transp { g.tris_transp.push(t.clone()) } else { g.tris.push(t.clone()) }
+                if chunk.transp {
+                    g.tris_transp.push(t.clone());
+                    g.transp_nodes.push(id);
+                } else {
+                    g.tris.push(t.clone());
+                    g.tri_nodes.push(id);
+                }
                 chunk.tris = Some(t);
             }
             if !wire_v.is_empty() {

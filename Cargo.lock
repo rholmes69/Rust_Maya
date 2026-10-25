@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "rust_maya"
-version = "2.3.0"
+version = "2.5.0"
 dependencies = [
  "bytemuck",
  "candle-core",
