@@ -1,0 +1,73 @@
+name: CI
+
+# Build, test and smoke-test the batch renderer on Windows and Linux for every push and
+# pull request. The release binaries are kept as downloadable artifacts for 14 days.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            exe: rust_maya.exe
+            artifact: rust_maya-windows-x64
+          - name: Linux x64
+            os: ubuntu-22.04
+            exe: rust_maya
+            artifact: rust_maya-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev \
+            libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      - name: Batch render smoke test
+        shell: bash
+        run: bash tools/ci_smoke.sh "target/release/${{ matrix.exe }}" smoke-out
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/${{ matrix.exe }}
+          retention-days: 14
+
+      - name: Upload smoke renders
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-renders-${{ runner.os }}
+          path: smoke-out/
+          retention-days: 7
+          if-no-files-found: ignore

@@ -1,6 +1,7 @@
 [package]
 name = "rust_maya"
-version = "0.1.0"
+version = "2.3.0"
+rust-version = "1.96"
 edition = "2024"
 
 [dependencies]

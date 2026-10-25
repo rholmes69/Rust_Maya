@@ -206,16 +206,21 @@ fn fmt_secs(s: f32) -> String {
 }
 
 /// On Windows a GUI-subsystem exe has no console; attach to the one it was started from so
-/// batch output shows up.
+/// batch output shows up. When output is already redirected (a pipe or file, as in CI or
+/// `| Out-Host`), the inherited handles are kept.
 #[cfg(windows)]
 pub fn attach_console() {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn AttachConsole(pid: u32) -> i32;
+        fn GetStdHandle(which: u32) -> *mut core::ffi::c_void;
     }
-    // ATTACH_PARENT_PROCESS
+    // STD_OUTPUT_HANDLE = (DWORD)-11; ATTACH_PARENT_PROCESS = (DWORD)-1.
     unsafe {
-        AttachConsole(u32::MAX);
+        let h = GetStdHandle(-11i32 as u32);
+        if h.is_null() || h as isize == -1 {
+            AttachConsole(u32::MAX);
+        }
     }
 }
 

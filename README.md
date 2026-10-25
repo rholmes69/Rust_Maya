@@ -1,5 +1,8 @@
 # Rust Maya
 
+[![CI](https://github.com/rholmes69/Rust_Maya/actions/workflows/ci.yml/badge.svg)](https://github.com/rholmes69/Rust_Maya/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rholmes69/Rust_Maya)](https://github.com/rholmes69/Rust_Maya/releases/latest)
+
 A Maya-style 3D content-creation app written in Rust with **egui** (UI) and **wgpu** (viewport rendering).
 It covers the **UI, polygon and edge modeling, NURBS curves with surface tools, Quad Draw retopology, keyframe
 animation, character rigging (with deformers and a one-click biped Quick Rig), look development (materials, lights,
@@ -8,9 +11,31 @@ particles and cloth simulation. Fluids, hair and Arnold rendering show up in the
 
 ![screenshot](docs/screenshot.png)
 
+## Download
+
+Ready-built Windows and Linux (x64) packages are on the [Releases page](https://github.com/rholmes69/Rust_Maya/releases). Unzip and run `rust_maya.exe` (Windows) or `./rust_maya` (Linux). The Linux build is made on Ubuntu 22.04 and runs on that or newer. Each release also lists the files' SHA-256 checksums in `SHA256SUMS.txt`.
+
+## Automatic builds (v2.3)
+
+GitHub Actions builds and tests every push to `main` and every pull request on **Windows** and **Linux** (`.github/workflows/ci.yml`):
+
+1. `cargo build --release` and `cargo test --release`.
+2. A smoke test of the batch renderer (`tools/ci_smoke.sh`). It makes an animated scene, renders a motion-blurred still with every pass and a 3-frame EXR sequence without a window, and checks the exit codes. The rendered images are uploaded so you can look at them.
+3. The release binaries are kept as downloadable artifacts for 14 days (Actions → the run → *Artifacts*).
+
+To publish a release, set `version` in Cargo.toml, commit, then tag and push:
+
+```
+git tag v2.3.0
+git push Rust_Maya v2.3.0
+```
+
+`.github/workflows/release.yml` then builds, tests and smoke-tests both platforms. It packages `rust_maya-v2.3.0-windows-x64.zip` and `rust_maya-v2.3.0-linux-x64.tar.gz` (binary, README and VPS guide) and publishes them as a GitHub Release with checksums and auto-generated notes. It can also be re-run by hand for an existing tag (Actions → Release → *Run workflow*).
+
 ## Build & run (Windows / macOS / Linux)
 
 1. Install Rust 1.96 or newer from https://rustup.rs (run `rustup update` if you already have it).
+   On Linux, also install the build packages: `sudo apt install pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev` (Debian/Ubuntu).
 2. In this folder, run:
 
 ```
@@ -331,7 +356,7 @@ renderSettings -x 960 -y 540 -spp 64 -env 0.3 -exp 0.5 -tm filmic -bg env   rend
 - **Motion blur:** tick *Motion blur* in the Render View (or `renderSettings -mb on -shutter 0.5`). The shutter is open for *Shutter* frames, centred on the current frame (0.5 = a 180° film shutter). The renderer samples the scene at shutter open and close and moves every triangle between the two per sample. Moving and rotating objects, deforming skinned characters, blend shapes and camera moves all blur. Simulations (particles, cloth, hair) are cached per whole frame, so they blur only with a shutter of 1 frame or more. A scene with nothing moving renders exactly as it does with motion blur off.
 - **Light-path passes:** the pass menu adds **Diffuse Direct, Diffuse Indirect, Specular** and **Emission**. Emission includes self-lit surfaces and sky seen directly. The four add up to the beauty before denoising. Each is estimated on its own: the first bounce picks either the diffuse or the specular lobe and weights it by that lobe alone. They are not denoised, so for compositing render with more samples.
 - **EXR:** a save path ending in `.exr` writes linear 32-bit float images (beauty with exposure applied and no tone mapping). The passes are written raw: normals as −1..1, depth as camera distance, object IDs as numbers.
-- **Batch renderer:** `rust_maya --render scene.rma` renders without opening a window, so it works on a headless server or VPS with no GPU or display. It uses the Render Settings and render camera saved in the scene, which are now stored in the .rma file. Without a saved camera it uses the first camera node. Command-line flags override any setting. Progress and an ETA print per frame. Exit codes: 0 = done, 1 = file or render error, 2 = bad arguments. On Windows, run it from a terminal and the output appears there. Run `rust_maya --help` for every option.
+- **Batch renderer:** `rust_maya --render scene.rma` renders without opening a window, so it works on a headless server or VPS with no GPU or display. It uses the Render Settings and render camera saved in the scene, which are now stored in the .rma file. Without a saved camera it uses the first camera node. Command-line flags override any setting. Progress and an ETA print per frame. Exit codes: 0 = done, 1 = file or render error, 2 = bad arguments. On Windows the app is a windowed program, so the terminal doesn't wait for it. In PowerShell, add `| Out-Host` to wait and see the progress (`.\rust_maya.exe --render shot.rma -all | Out-Host`), and `$LASTEXITCODE` holds the exit code. In cmd, use `start /wait rust_maya.exe --render …`. `rust_maya --version` prints the version. Run `rust_maya --help` for every option.
 
 ```
 rust_maya --render shot.rma -s 1 -e 120 -o renders/shot.png                 (frames → shot.0001.png …)

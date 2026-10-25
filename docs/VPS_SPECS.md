@@ -40,6 +40,15 @@ ssh -N -L 11434:127.0.0.1:11434 user@your-vps
 | OS | Ubuntu 22.04 / 24.04 | Same, with desktop packages |
 | Remote access | Desktop + VNC | Desktop + a GPU-friendly remote desktop such as NICE DCV, Parsec or Sunshine/Moonlight; plain VNC/RDP feels sluggish for a 3D viewport |
 
+## Option C — a render node (batch rendering, v2.2+)
+
+A VPS can render scenes with `rust_maya --render scene.rma` and no desktop, GPU or display. The path tracer runs on the CPU and uses every core, so pay for cores rather than a GPU. 8–16 vCPU with 4–8 GB RAM is a good start, and 2 vCPU works for tests. Download the Linux package from the GitHub Releases page; there's no need to build on the server. Debian/Ubuntu servers need ALSA at runtime: `sudo apt install libasound2`.
+
+```
+tar xzf rust_maya-v2.3.0-linux-x64.tar.gz && cd rust_maya-v2.3.0-linux-x64
+./rust_maya --render ~/shots/shot.rma -s 1 -e 120 -o ~/renders/shot.png
+```
+
 ## Building
 
 - **Rust 1.96 or newer**, plus the X11/Wayland development packages and ALSA (for the voice feature) on Linux.
